@@ -1036,7 +1036,7 @@ class Trainer:
             self.optimizer.zero_grad()
 
             # 混合精度前向传播
-            with torch.cuda.amp.autocast2(enabled=torch.cuda.is_available()):
+            with torch.autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu', enabled=torch.cuda.is_available()):
                 outputs = self.model(static, temporal)
                 loss = self.criterion(outputs, labels)
 
