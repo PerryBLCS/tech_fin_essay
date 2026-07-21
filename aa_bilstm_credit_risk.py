@@ -60,7 +60,7 @@ class CreditDataLoader(Dataset):
     def load_german_credit(self, filepath=None):
         """
         German Credit Dataset (1000样本, 20特征, 30%违约率)
-        论文中提到: 将6个类别属性编码为伪时序数据
+        将6个类别属性编码为伪时序数据
         """
         # 如果没有提供文件路径, 使用 UCI 在线数据
         source = GERMAN_CREDIT_URL if filepath is None else filepath
@@ -112,13 +112,13 @@ class CreditDataLoader(Dataset):
         static_features = pd.concat([numeric_df, categorical_df], axis=1).values.astype(np.float32)
         self.static_feature_names = [str(c) for c in list(numeric_df.columns) + list(categorical_df.columns)]
 
-        # 4. 构建伪时序特征：按论文使用6个类别属性
+        # 4. 构建伪时序特征：按顺序使用6个类别属性
         temporal_features = self._build_german_pseudo_temporal(df).astype(np.float32)
 
         return static_features, temporal_features, y
 
     def _build_german_pseudo_temporal(self, df):
-        """基于六个分类属性构建与论文一致的伪时间特征"""
+        """基于六个分类属性构建伪时间特征"""
         selected_cols = [0, 2, 3, 5, 6, 8]
         self.temporal_step_names = [
             'checking_status',
@@ -258,8 +258,7 @@ class CreditDataLoader(Dataset):
             dtype=np.float32
         )
 
-        # 论文第4.6节指出了这些预警指标
-        # 仅使用目标月份之前可用的六个月历史数据
+        # 使用目标月份之前可用的六个月历史数据
         limit_balance = np.maximum(df['LIMIT_BAL'].astype(float).values, 1.0)
         bill_values = df[bill_cols].astype(float).values
         payment_values = df[pay_amt_cols].astype(float).values
@@ -519,7 +518,7 @@ class AdaptiveGatedResUnit(nn.Module):
     """
         自适应门控残差单元 (AG-ResUnit)
 
-        论文描述:
+        描述:
         - 引入可学习参数λ动态调节遗忘门、输入门、输出门比例
         - 残差连接构建深层网络(8层)
         - 扩展长期记忆能力至36个月
@@ -855,7 +854,7 @@ class AABiLSTM(nn.Module):
                 multi_scale_token = self.multiscale_context_proj(multi_scale_repr).unsqueeze(1)
                 attention_context = torch.cat([projected_temporal, multi_scale_token], dim=1)
             cross_fused, attention_weights = self.cross_attention(static_emb, attention_context)
-            # 与论文一致的顺序：先进行多尺度/时序交叉注意力，再进行 AG-BiLSTM 编码
+            # 先进行多尺度/时序交叉注意力，再进行 AG-BiLSTM 编码
             sequence_input = self.cross_context_norm(projected_temporal + cross_fused.unsqueeze(1))
 
         sequence_out = self._encode_sequence(sequence_input)
@@ -882,7 +881,7 @@ class DynamicFocalLoss(nn.Module):
     """
     动态焦点损失函数 (Dynamic Focal Loss)
 
-    论文描述:
+    描述:
     - 根据训练epoch和类别预测难度动态调整γ
     - 早期训练: γ较小，关注易分样本
     - 后期训练: γ增大，聚焦难分样本
@@ -1080,7 +1079,6 @@ class Trainer:
                 all_labels.append(labels.cpu().numpy())
 
         # 计算指标
-        # 修改为
         # 展平嵌套列表
         flat_labels = np.concatenate(all_labels)
         flat_preds = np.concatenate(all_preds)
@@ -1207,7 +1205,7 @@ def specificity_score(y_true, y_pred):
 
 
 class SequenceBaselineModel(nn.Module):
-    """论文中使用的 LSTM/Bi-LSTM/Attention-LSTM/ResNet-LSTM 基线模型"""
+    """LSTM/Bi-LSTM/Attention-LSTM/ResNet-LSTM 基线模型"""
 
     def __init__(self, static_dim, temporal_dim, hidden_dim=64, model_type='lstm', dropout=0.3):
         super().__init__()
@@ -1253,7 +1251,7 @@ class SequenceBaselineModel(nn.Module):
 def train_sequence_baseline(name, model, X_static_train, X_temporal_train, y_train,
                             X_static_test, X_temporal_test, y_test,
                             epochs=20, batch_size=128, lr=1e-3):
-    """训练一个轻量级神经网络基线模型，并返回与论文对齐的评估指标"""
+    """训练一个轻量级神经网络基线模型，并返回评估指标"""
     train_dataset = CreditDataset(X_static_train, X_temporal_train, y_train)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                               pin_memory=torch.cuda.is_available())
@@ -1558,7 +1556,7 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
         batch_size = 128 if batch_size is None else batch_size
         epoch = 150 if epoch is None else epoch
         hidden_dim = 128
-        num_layers = 8  # 论文内容为8层
+        num_layers = 8
         num_heads = 8
         dropout = 0.4
         lr = 5e-4
@@ -1722,7 +1720,7 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
 def compare_baselines(X_static_train, X_temporal_train, y_train,
                       X_static_test, X_temporal_test, y_test,
                       deep_epochs=20, batch_size=128):
-    """与论文列出的传统ML和深度学习基准模型对比。"""
+    """与传统ML和深度学习基准模型对比。"""
     from sklearn.ensemble import RandomForestClassifier
 
     # 展平时序特征用于传统 ML
