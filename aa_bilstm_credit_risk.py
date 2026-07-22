@@ -12,7 +12,8 @@ from sklearn.linear_model import LogisticRegression
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, confusion_matrix, average_precision_score, recall_score
+from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, confusion_matrix, average_precision_score, \
+    recall_score, precision_score
 from sklearn.svm import SVC
 from sklearn.neural_network import MLPClassifier
 import shap
@@ -991,18 +992,18 @@ class Trainer:
         if use_dynamic_focal:
             self.criterion = DynamicFocalLoss(
                 num_epoch=num_epochs,
-                alpha_pos=0.75,  # 增强对违约类的关注
+                alpha_pos=0.75,
                 alpha_neg=0.25,
                 gamma_base=1.0,
                 gamma_max=3.0
             )
         else:
-            # 标准交叉熵更适合优化整体 Accuracy；如需强调少数类可打开 use_class_weight
-            if use_class_weight:
-                weights = self._compute_class_weights(train_loader)
-                self.criterion = nn.CrossEntropyLoss(weight=weights.to(device))
-            else:
-                self.criterion = nn.CrossEntropyLoss()
+            # 始终使用类别权重，提升少数类（违约）的关注度
+            weights = self._compute_class_weights(train_loader)
+            # 增强正类权重：让模型更关注违约样本
+            weights = weights * torch.tensor([1.0, 1.5]).to(device)
+            weights = weights / weights.sum() * 2
+            self.criterion = nn.CrossEntropyLoss(weight=weights.to(device))
 
         self.early_stopping = EarlyStopping(patience=10)
         self.history = {'train_loss': [], 'val_auc': [], 'val_auc_pr': [], 'val_f1': [], 'val_accuracy': []}
@@ -1110,35 +1111,40 @@ class Trainer:
             'labels': flat_labels,
         }
 
-    def find_best_threshold(self, min_sensitivity=0.40):
-        """仅在验证集上选择概率阈值"""
+    def find_best_threshold(self, min_sensitivity=0.50):
+        """在验证集上选择最优阈值（平衡敏感性和准确率）"""
         validation = self.evaluate(self.val_loader, threshold=0.5)
         labels = validation['labels']
         probabilities = validation['probabilities']
-        scored = []
 
-        for threshold in np.linspace(0.05, 0.95, 181):
+        best_score = -1
+        best_threshold = 0.5
+        best_metrics = validation
+
+        for threshold in np.linspace(0.3, 0.6, 61):
             predictions = (probabilities >= threshold).astype(int)
-            sensitivity = recall_score(labels, predictions)
-            if sensitivity + 1e-12 < min_sensitivity:
+            sensitivity = recall_score(labels, predictions, zero_division=0)
+
+            if sensitivity < min_sensitivity:
                 continue
-            accuracy = accuracy_score(labels, predictions)
+
             f1 = f1_score(labels, predictions, zero_division=0)
-            scored.append((accuracy, f1, sensitivity, -abs(threshold - 0.5), threshold))
+            accuracy = accuracy_score(labels, predictions)
 
-        if not scored:
-            return 0.5, {
-                'accuracy': validation['accuracy'],
-                'f1': validation['f1'],
-                'sensitivity': validation['sensitivity'],
-            }
+            score = 0.7 * f1 + 0.3 * accuracy
 
-        accuracy, f1, sensitivity, _, threshold = max(scored)
-        return float(threshold), {
-            'accuracy': float(accuracy),
-            'f1': float(f1),
-            'sensitivity': float(sensitivity),
-        }
+            if score > best_score:
+                best_score = score
+                best_threshold = threshold
+                best_metrics = {
+                    'accuracy': accuracy,
+                    'f1': f1,
+                    'sensitivity': sensitivity,
+                    'specificity': specificity_score(labels, predictions),
+                    'precision': precision_score(labels, predictions, zero_division=0),
+                }
+
+        return float(best_threshold), best_metrics
 
     def train(self):
         """完整训练流程"""
