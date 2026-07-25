@@ -2068,16 +2068,17 @@ class Trainer:
                  threshold_confidence=0.80):
         if num_epochs < 1:
             raise ValueError("num_epochs must be at least 1.")
-        if selection_metric not in {'auc', 'auc_pr', 'hybrid'}:
+        if selection_metric not in {'auc', 'auc_pr', 'hybrid', 'accuracy'}:
             raise ValueError(
-                "selection_metric must be 'auc', 'auc_pr' or 'hybrid'."
+                "selection_metric must be 'auc', 'auc_pr', 'hybrid' or "
+                "'accuracy'."
             )
         if threshold_objective not in {
-            'hybrid', 'f1', 'balanced_accuracy'
+            'hybrid', 'f1', 'balanced_accuracy', 'accuracy'
         }:
             raise ValueError(
-                "threshold_objective must be 'hybrid', 'f1' or "
-                "'balanced_accuracy'."
+                "threshold_objective must be 'hybrid', 'f1', "
+                "'balanced_accuracy' or 'accuracy'."
             )
         if not 0.0 <= class_balance_power <= 1.0:
             raise ValueError("class_balance_power must be in [0, 1].")
@@ -2236,7 +2237,11 @@ class Trainer:
                     shadow.copy_(value)
 
     def _selection_score(self, metrics):
-        if self.selection_metric != 'hybrid':
+        if self.selection_metric == 'hybrid':
+            pass  # fallthrough below
+        elif self.selection_metric == 'accuracy':
+            return float(metrics['accuracy'])
+        else:
             return float(metrics[self.selection_metric])
         # 排序能力为主，同时轻度偏向 Accuracy 与敏感性更均衡的 epoch。
         values = (
@@ -2694,14 +2699,16 @@ class Trainer:
                 objective = f1
             elif self.threshold_objective == 'balanced_accuracy':
                 objective = balanced_accuracy
+            elif self.threshold_objective == 'accuracy':
+                objective = accuracy
             else:
                 # 在敏感性硬约束内以 Accuracy 为主，再奖励类间平衡与 F1。
                 objective = (
-                    0.75 * accuracy
-                    + 0.10 * balanced_accuracy
-                    + 0.10 * f1
-                    + 0.025 * sensitivity
-                    + 0.025 * specificity
+                        0.75 * accuracy
+                        + 0.10 * balanced_accuracy
+                        + 0.10 * f1
+                        + 0.025 * sensitivity
+                        + 0.025 * specificity
                 )
             candidate = (
                 objective,
@@ -3153,6 +3160,13 @@ class Explainer:
             temporal_data[sample_size:sample_size + explain_size]
         ).float().to(device)
 
+        # 过滤 SHAP 对 LayerNorm 的警告
+        warnings.filterwarnings(
+            'ignore',
+            message='.*unrecognized nn.Module.*',
+            category=UserWarning,
+        )
+
         try:
             # 尝试使用 DeepExplainer
             print("Attempting SHAP DeepExplainer...")
@@ -3556,7 +3570,7 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
         )
     if threshold_min_sensitivity is None:
         threshold_min_sensitivity = (
-            0.65 if dataset_name == 'german' else 0.55
+            0.5 if dataset_name == 'german' else 0.55
         )
     if not 0.0 <= threshold_min_sensitivity <= 1.0:
         raise ValueError("threshold_min_sensitivity must be in [0, 1].")
@@ -4093,16 +4107,23 @@ def compare_baselines(X_static_train, X_temporal_train, y_train,
     """与传统ML和深度学习基准模型对比。"""
     from sklearn.ensemble import RandomForestClassifier
 
-    # 展平时序特征用于传统 ML
-    X_train_flat = np.concatenate([
-        X_static_train,
-        X_temporal_train.reshape(X_temporal_train.shape[0], -1)
-    ], axis=1)
+    # 展平时序特征用于传统 ML，保持 DataFrame 格式以保留特征名
+    temporal_train_flat = X_temporal_train.reshape(X_temporal_train.shape[0], -1)
+    temporal_test_flat = X_temporal_test.reshape(X_temporal_test.shape[0], -1)
 
-    X_test_flat = np.concatenate([
-        X_static_test,
-        X_temporal_test.reshape(X_static_test.shape[0], -1)
-    ], axis=1)
+    # 生成特征名
+    static_cols = [f'static_{i}' for i in range(X_static_train.shape[1])]
+    temporal_cols = [f'temporal_{i}' for i in range(temporal_train_flat.shape[1])]
+    feature_names = static_cols + temporal_cols
+
+    X_train_flat = pd.DataFrame(
+        np.concatenate([X_static_train, temporal_train_flat], axis=1),
+        columns=feature_names
+    )
+    X_test_flat = pd.DataFrame(
+        np.concatenate([X_static_test, temporal_test_flat], axis=1),
+        columns=feature_names
+    )
 
     models = {
         'Logistic Regression': LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42),
@@ -5405,13 +5426,13 @@ def parse_args():
     )
     parser.add_argument(
         '--selection-metric',
-        choices=['auc', 'auc_pr', 'hybrid'],
+        choices=['auc', 'auc_pr', 'hybrid', 'accuracy'],
         default='auc_pr',
         help='Validation metric used for checkpoint selection and early stopping.',
     )
     parser.add_argument(
         '--threshold-objective',
-        choices=['hybrid', 'f1', 'balanced_accuracy'],
+        choices=['hybrid', 'f1', 'balanced_accuracy', 'accuracy'],
         default='hybrid',
         help='Validation objective used to choose the operating threshold.',
     )
