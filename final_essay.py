@@ -82,8 +82,7 @@ warnings.filterwarnings(
 #   4. 训练器（含 Platt 概率校准、阈值搜索、EMA、混合精度）
 #   5. BlackSwanMonitor 分布外（OOD）监测器
 #   6. SHAP 可解释性分析
-#   7. 对比实验（传统 ML / 深度学习基线、消融实验、不平衡鲁棒性、
-#      历史长度敏感性）
+#   7. 对比实验（传统 ML / 深度学习基线、消融实验、不平衡鲁棒性）
 #
 # 运行入口：python final_essay.py --dataset german 或 --dataset taiwan
 # ============================================================
@@ -561,46 +560,6 @@ class CreditDataLoader:
 
         print(f"Loaded real Taiwan Credit data from: {filepath}")
         return static_features, temporal_features, y
-
-    @staticmethod
-    def extend_temporal_features(temporal_features, target_steps, method='linear_trend'):
-        """
-        扩展时间序列数据到指定的时间步数
-
-        参数:
-            temporal_features: 原始时间序列数据 (n_samples, current_steps, n_features)
-            target_steps: 目标时间步数 (如 12, 24, 36)
-            method: 扩展方法
-                - 'linear_trend': 基于线性趋势外推（默认）
-        返回:
-            扩展后的时间序列数据 (n_samples, target_steps, n_features)
-        """
-        current_steps = temporal_features.shape[1]
-
-        if target_steps <= current_steps:
-            return temporal_features
-
-        n_samples = temporal_features.shape[0]
-        n_features = temporal_features.shape[2]
-        extended = np.zeros((n_samples, target_steps, n_features), dtype=temporal_features.dtype)
-        extended[:, :current_steps, :] = temporal_features
-
-        if method == 'linear_trend':
-            for i in range(current_steps, target_steps):
-                # 外推衰减因子：每多推一步，置信度乘 0.85，
-                # 模拟长期预测的不确定性递增。
-                decay_factor = 0.85 ** (i - current_steps)
-                if current_steps >= 2:
-                    trend = temporal_features[:, -1, :] - temporal_features[:, -2, :]
-                    extended[:, i, :] = extended[:, i - 1, :] + trend * decay_factor
-                else:
-                    extended[:, i, :] = temporal_features[:, -1, :]
-
-        else:
-            raise ValueError(
-                f"Unknown extension method: {method}. Choose from 'linear_trend'")
-
-        return extended
 
     def _encode_static_from_training(self, train_idx, *evaluation_indices):
         """使用训练集类别词表对多个数据子集做 one-hot 编码。
@@ -4288,7 +4247,7 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
     3. 初始化 AA-BiLSTM 模型
     4. 训练（含 auto-tune 可选超参搜索）
     5. 测试集评估 + OOD 选择性风险 + 公平性审计 + Bootstrap CI
-    6. 可选：baselines 对比、消融实验、历史长度敏感性、不平衡鲁棒性
+    6. 可选：baselines 对比、消融实验、不平衡鲁棒性
     7. 可选：SHAP 解释 + 融合模块诊断 + 训练历史可视化
 
     Args:
@@ -4795,25 +4754,6 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
                            use_step_embedding=(dataset_name == 'taiwan'),
                            threshold_confidence=threshold_confidence)
 
-    if run_analysis and dataset_name == 'taiwan':
-        run_history_length_study(
-            static_feat,
-            temporal_feat,
-            y,
-            dataset_name=dataset_name,
-            epoch=min(epoch, 30),
-            batch_size=batch_size,
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
-            dropout=dropout,
-            split_seed=split_seed,
-            extend_method=None
-        )
-    elif run_analysis:
-        print(
-            "History-length study skipped for German: its six pseudo steps "
-            "are heterogeneous attributes rather than calendar history."
-        )
 
     if run_analysis:
         run_imbalance_robustness_study(
@@ -5446,210 +5386,6 @@ def run_imbalance_robustness_study(X_static_train, X_temporal_train, y_train,
               f"{row['aa_auc']:<10.4f} {row['aa_auc_pr']:<10.4f} {row['aa_sensitivity']:<10.4f}")
 
     print("=" * 60)
-    return results
-
-
-def run_history_length_study(static_features, temporal_features, y, dataset_name,
-                             history_lengths=(3, 6, 12, 24, 36), epoch=30,
-                             batch_size=128, hidden_dim=128, num_layers=8,
-                             dropout=0.4, extend_method=None,
-                             split_seed=42):
-    """
-    长期依赖能力验证：在不同历史长度下对比 Standard LSTM、Bi-LSTM 和 AA-BiLSTM。
-
-    Args:
-        static_features: (N, S) 静态特征
-        temporal_features: (N, T, F) 时序特征
-        y: (N,) 标签
-        dataset_name: 'german' 或 'taiwan'
-        history_lengths: 要测试的历史长度（月数）序列
-        epoch: 每个配置的训练轮数
-        batch_size: 批次大小
-        hidden_dim: 隐藏维度
-        num_layers: 循环层数
-        dropout: Dropout 比率
-        extend_method: 数据扩展方法；None 表示仅使用真实数据
-        split_seed: 数据分割随机种子
-
-    Returns:
-        dict: {模型名: [{history_length, auc, status}, ...]}
-    """
-    available_steps = temporal_features.shape[1]
-
-    print("\n" + "=" * 60)
-    print("HISTORY LENGTH STUDY")
-    print("=" * 60)
-    print(f"Original dataset has {available_steps} time steps")
-    print(f"Testing history lengths: {history_lengths}")
-    print(f"Extension method: {extend_method if extend_method else 'None (real data only)'}")
-    print("-" * 60)
-
-    # 定义三种模型配置
-    model_configs = {
-        'Standard LSTM': {
-            'model_class': SequenceBaselineModel,
-            'kwargs': {'model_type': 'lstm', 'hidden_dim': min(hidden_dim, 128), 'dropout': dropout}
-        },
-        'Bi-LSTM': {
-            'model_class': SequenceBaselineModel,
-            'kwargs': {'model_type': 'bilstm', 'hidden_dim': min(hidden_dim, 128), 'dropout': dropout}
-        },
-        'AA-BiLSTM': {
-            'model_class': AABiLSTM,
-            'kwargs': {
-                'hidden_dim': hidden_dim,
-                'num_layers': num_layers,
-                'num_classes': 2,
-                'dropout': dropout,
-                'use_fusion': True,
-                'use_ag_resunit': True,
-                'bidirectional': True,
-                'use_multiscale': True,
-                'local_window': 3,
-                'use_global_context': True,
-                'use_local_attention': dataset_name == 'taiwan',
-                'temporal_categorical_index': (
-                    0 if dataset_name == 'taiwan' else None
-                ),
-                'use_step_embedding': dataset_name == 'taiwan',
-                'multiscale_mode': (
-                    'lightweight' if dataset_name == 'taiwan' else 'legacy'
-                ),
-            }
-        }
-    }
-
-    results = {name: [] for name in model_configs.keys()}
-
-    for length in history_lengths:
-        print(f"\n{'=' * 40}")
-        print(f"Testing history length: {length} months")
-        print(f"{'=' * 40}")
-
-        # 决定是否需要扩展数据
-        if length <= available_steps:
-            # 使用真实数据（截取最后length个月）
-            subset_temporal = temporal_features[:, -length:, :]
-            print(f"Using real data (last {length} months from {available_steps})")
-        elif extend_method:
-            # 先截取到最大可用，然后扩展到目标长度
-            subset_temporal = CreditDataLoader.extend_temporal_features(
-                temporal_features, length, method=extend_method
-            )
-            print(f"Extended from {available_steps} to {length} months using '{extend_method}' method")
-        else:
-            print(f"Skipped: dataset only has {available_steps} steps and extension is disabled")
-            for name in model_configs.keys():
-                results[name].append({'history_length': length, 'auc': None, 'status': 'skipped'})
-            continue
-
-        # preprocess() 内部会重新拟合 scaler 和 split，无需 deepcopy 模板
-        data_loader = CreditDataLoader()
-        data_loader.temporal_step_names = [f'month_{i + 1}' for i in range(length)]
-        data_loader.temporal_feature_names = ['feature_' + str(i) for i in range(temporal_features.shape[2])]
-
-        # 数据预处理
-        (X_static_train, X_temporal_train, y_train,
-         X_static_val, X_temporal_val, y_val,
-         X_static_test, X_temporal_test, y_test) = data_loader.preprocess(
-            static_features,
-            subset_temporal,
-            y,
-            split_seed=split_seed,
-        )
-        (
-            X_static_calibration,
-            X_temporal_calibration,
-            y_calibration,
-        ) = data_loader.calibration_data_
-
-        train_loader = DataLoader(
-            CreditDataset(X_static_train, X_temporal_train, y_train),
-            batch_size=batch_size,
-            shuffle=True,
-            pin_memory=torch.cuda.is_available()
-        )
-        val_loader = DataLoader(
-            CreditDataset(X_static_val, X_temporal_val, y_val),
-            batch_size=batch_size,
-            pin_memory=torch.cuda.is_available()
-        )
-        calibration_loader = DataLoader(
-            CreditDataset(
-                X_static_calibration,
-                X_temporal_calibration,
-                y_calibration,
-            ),
-            batch_size=batch_size,
-            pin_memory=torch.cuda.is_available(),
-        )
-        test_loader = DataLoader(
-            CreditDataset(X_static_test, X_temporal_test, y_test),
-            batch_size=batch_size,
-            pin_memory=torch.cuda.is_available()
-        )
-
-        # 测试三种模型
-        for model_name, config in model_configs.items():
-            print(f"\nTraining {model_name}...")
-
-            if config['model_class'] == SequenceBaselineModel:
-                model = config['model_class'](
-                    static_dim=X_static_train.shape[1],
-                    temporal_dim=X_temporal_train.shape[2],
-                    **config['kwargs']
-                )
-            else:  # AABiLSTM
-                model = config['model_class'](
-                    static_dim=X_static_train.shape[1],
-                    temporal_dim=X_temporal_train.shape[2],
-                    temporal_steps=X_temporal_train.shape[1],
-                    **config['kwargs']
-                )
-
-            trainer = Trainer(
-                model,
-                train_loader,
-                val_loader,
-                test_loader,
-                calibration_loader=calibration_loader,
-                num_epochs=epoch,
-                lr=1e-3 if dataset_name == 'german' else 5e-4,
-                weight_decay=1e-4 if dataset_name == 'german' else 2e-4,
-                use_dynamic_focal=False,
-                use_early_stopping=True,
-                threshold_confidence=(
-                    0.60 if dataset_name == 'german' else 0.80
-                ),
-            )
-            metrics, _ = trainer.train()
-
-            results[model_name].append({
-                'history_length': length,
-                'auc': metrics['auc'],
-                'status': 'evaluated'
-            })
-            print(f"{model_name}: AUC={metrics['auc']:.4f}")
-
-    # 打印汇总表格
-    print("\n" + "=" * 70)
-    print("HISTORY LENGTH STUDY SUMMARY")
-    print("=" * 70)
-    print(f"{'Length':<10} {'Standard LSTM':<15} {'Bi-LSTM':<15} {'AA-BiLSTM':<15}")
-    print("-" * 70)
-
-    for i, length in enumerate(history_lengths):
-        lstm_auc = results['Standard LSTM'][i]['auc']
-        bilstm_auc = results['Bi-LSTM'][i]['auc']
-        aa_auc = results['AA-BiLSTM'][i]['auc']
-
-        lstm_str = f"{lstm_auc:.4f}" if lstm_auc is not None else "N/A"
-        bilstm_str = f"{bilstm_auc:.4f}" if bilstm_auc is not None else "N/A"
-        aa_str = f"{aa_auc:.4f}" if aa_auc is not None else "N/A"
-
-        print(f"{length:<10} {lstm_str:<15} {bilstm_str:<15} {aa_str:<15}")
-    print("=" * 70)
-
     return results
 
 
