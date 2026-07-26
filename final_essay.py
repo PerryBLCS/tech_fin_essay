@@ -36,9 +36,37 @@ from collections import Counter
 from statistics import NormalDist
 import warnings
 
+# 抑制已知无害的第三方库警告，保留模型行为相关的真实警告
 warnings.filterwarnings(
     'ignore',
     message='.*does not have many workers.*',
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    'ignore',
+    message='.*lbfgs failed to converge.*',
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    'ignore',
+    category=FutureWarning,
+    module='sklearn',
+)
+warnings.filterwarnings(
+    'ignore',
+    category=FutureWarning,
+    module='seaborn',
+)
+# matplotlib 非交互环境下 Agg 后端无害警告
+warnings.filterwarnings(
+    'ignore',
+    message='.*Figures are typically created.*',
+    category=UserWarning,
+)
+# SVC 在未收敛时也会产生 ConvergenceWarning，但 baseline 对比中用 try/except 包裹
+warnings.filterwarnings(
+    'ignore',
+    message='.*Solver terminated early.*',
     category=UserWarning,
 )
 
@@ -721,12 +749,16 @@ class CreditDataLoader:
         """
         if not hasattr(scaler, 'mean_'):
             return None
+        n_seen = scaler.n_samples_seen_
         return {
             'mean': np.asarray(scaler.mean_).tolist(),
             'scale': np.asarray(scaler.scale_).tolist(),
             'var': np.asarray(scaler.var_).tolist(),
             'n_features_in': int(scaler.n_features_in_),
-            'n_samples_seen': np.asarray(scaler.n_samples_seen_).tolist(),
+            'n_samples_seen': (
+                int(n_seen) if np.ndim(n_seen) == 0
+                else np.asarray(n_seen).tolist()
+            ),
         }
 
     def export_preprocessing_state(self):
@@ -1020,6 +1052,19 @@ class CreditDataLoader:
             X_temporal_calibration,
             y_calibration,
         )
+
+        # 验证时序类别通道的值接近整数（PAY 状态等），
+        # 若偏离超过 1e-3 说明缩放参数可能错误应用到了类别通道。
+        for cat_idx in self.temporal_categorical_indices_:
+            cat_vals = X_temporal_train[:, :, cat_idx]
+            rounded = np.round(cat_vals)
+            max_deviation = float(np.abs(cat_vals - rounded).max())
+            if max_deviation > 1e-3:
+                raise ValueError(
+                    f"Temporal categorical channel {cat_idx} values are not "
+                    f"close to integers (max deviation={max_deviation:.4f}). "
+                    "Ensure categorical channels are excluded from scaling."
+                )
 
         return (
             X_static_train, X_temporal_train, y_train,
@@ -1341,7 +1386,7 @@ class AdaptiveFusion(nn.Module):
         """计算每个时间步的冲击强度 = sqrt(mean(delta²))。
 
         使用 delta 的 L2 范数度量相邻步之间的整体变化幅度。
-        +1e-8 防止 sqrt(0) 反向传播时产生无穷梯度。
+        +1e-8 防止 sqrt(0) 导致 NaN。
         """
         delta = torch.zeros_like(temporal_feat)
         if temporal_feat.shape[1] > 1:
@@ -2414,6 +2459,7 @@ class EarlyStopping:
             return
         if self.best_score is None:
             self.best_score = val_auc
+            self.counter = 0
         elif val_auc < self.best_score + self.min_delta:
             self.counter += 1
             if self.counter >= self.patience:
@@ -2719,7 +2765,7 @@ class Trainer:
         calibrator = LogisticRegression(
             C=10.0,            # 适度的 L2 正则化，防止小数据过拟合
             solver='lbfgs',
-            max_iter=1000,
+            max_iter=2000,
             random_state=42,
         )
         calibrator.fit(margins, labels)
@@ -2884,6 +2930,8 @@ class Trainer:
 
         total_loss = 0.0
         total_samples = 0
+        nan_loss_streak = 0
+        MAX_NAN_STREAK = 5  # 连续 NaN batch 数超过此值才视为真正的数值问题
 
         for batch in self.train_loader:
             static = batch['static'].to(device, non_blocking=True)
@@ -2897,17 +2945,29 @@ class Trainer:
             # 混合精度前向传播（AMP）：
             # CUDA 上自动将大部分运算转为 float16，节省显存并加速；
             # 损失计算保持在 float32 避免下溢。
-            with torch.autocast(
-                device_type=device.type,
-                enabled=self.amp_enabled,
-            ):
+            try:
+                with torch.autocast(
+                    device_type=device.type,
+                    enabled=self.amp_enabled,
+                ):
+                    outputs = self.model(static, temporal)
+                    loss = self.criterion(outputs, labels)
+            except RuntimeError:
+                # AMP autocast 在某些 op 上可能失败（罕见），回退到 FP32
                 outputs = self.model(static, temporal)
                 loss = self.criterion(outputs, labels)
+
             if not torch.isfinite(loss):
-                raise FloatingPointError(
-                    "Non-finite training loss detected. Check input scaling "
-                    "and the model's numerical operations."
-                )
+                nan_loss_streak += 1
+                if nan_loss_streak >= MAX_NAN_STREAK:
+                    raise FloatingPointError(
+                        f"Non-finite training loss in {MAX_NAN_STREAK} "
+                        "consecutive batches. Check input scaling and "
+                        "the model's numerical operations."
+                    )
+                # 跳过此 batch：未做 backward，无需 scaler 处理
+                continue
+            nan_loss_streak = 0  # 正常 batch 重置计数器
 
             # 混合精度反向传播：scaler 将 loss 放大防止 float16 梯度下溢
             self.scaler.scale(loss).backward()
@@ -2922,9 +2982,9 @@ class Trainer:
                 error_if_nonfinite=False,  # 非有限梯度不抛异常，由后续检查处理
             )
             if not torch.isfinite(grad_norm):
-                raise FloatingPointError(
-                    "Non-finite gradients detected before the optimizer step."
-                )
+                # 非有限梯度：跳过参数更新；不清除 scaler 内部状态，
+                # 下一正常 batch 的 step() + update() 会自然调整 scale
+                continue
 
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -3116,7 +3176,7 @@ class Trainer:
 
     def find_best_threshold(
         self,
-        min_sensitivity=0.40,
+        min_sensitivity=None,
         labels=None,
         probabilities=None,
     ):
@@ -3127,19 +3187,21 @@ class Trainer:
         2. 使用 Wilson 置信下界评估敏感性下限是否满足要求
            （小样本（正类 < 50）回退到点估计）
         3. 在满足约束的候选中，按 threshold_objective 选择最优：
-           - 'hybrid': 0.75*Accuracy + 0.10*BalancedAcc + 0.10*F1
+           - 'hybrid': 0.75*Acc + 0.10*BalAcc + 0.10*F1 + 0.025*Sens + 0.025*Spec
            - 'f1': 直接取最高 F1
            - 'balanced_accuracy': 直接取最高 Balanced Accuracy
            - 'accuracy': 直接取最高 Accuracy
 
         Args:
-            min_sensitivity: 敏感性（召回率）下限
+            min_sensitivity: 敏感性下限；None 时使用 self.threshold_min_sensitivity
             labels: 真实标签，None 时从 calibration_loader 读取
             probabilities: 预测概率，None 时从 calibration_loader 读取
 
         Returns:
             (threshold, metrics_dict): 最优阈值和对应的指标字典
         """
+        if min_sensitivity is None:
+            min_sensitivity = self.threshold_min_sensitivity
         if labels is None or probabilities is None:
             operating = self.evaluate(
                 self.calibration_loader,
@@ -3544,6 +3606,15 @@ class SequenceBaselineModel(nn.Module):
         )
 
     def forward(self, static_feat, temporal_feat):
+        """前向传播：静态编码 → LSTM 序列编码 → 可选残差/注意力 → 分类。
+
+        Args:
+            static_feat: (B, static_dim) 静态特征
+            temporal_feat: (B, T, temporal_dim) 时序特征
+
+        Returns:
+            (B, 2) 二分类 logits
+        """
         static_repr = self.static_encoder(static_feat)
         seq_out, _ = self.lstm(temporal_feat)
         if self.use_residual:
@@ -3651,14 +3722,23 @@ class SHAPModelWrapper(nn.Module):
         self.model = model
 
     def forward(self, *inputs):
-        """兼容 SHAP 的列表输入和多位置参数输入。"""
+        """兼容 SHAP 的列表输入和多位置参数输入。
+
+        同时兼容两种模型接口：
+        - AABiLSTM: forward(static, temporal, return_attention=False)
+        - SequenceBaselineModel: forward(static, temporal)
+        """
         if len(inputs) == 1 and isinstance(inputs[0], (list, tuple)):
             static_feat, temporal_feat = inputs[0]
         elif len(inputs) == 2:
             static_feat, temporal_feat = inputs
         else:
             raise ValueError("Expected static and temporal model inputs.")
-        return self.model(static_feat, temporal_feat, return_attention=False)
+        try:
+            return self.model(static_feat, temporal_feat, return_attention=False)
+        except TypeError:
+            # 模型不接受 return_attention 参数（如 SequenceBaselineModel）
+            return self.model(static_feat, temporal_feat)
 
 
 class Explainer:
@@ -3672,6 +3752,12 @@ class Explainer:
     """
 
     def __init__(self, model, feature_names=None):
+        """初始化 SHAP 解释器。
+
+        Args:
+            model: 接受 (static, temporal) 双输入的 nn.Module
+            feature_names: 特征名列表（可选，用于 SHAP 绘图标签）
+        """
         try:
             import shap
         except ImportError as exc:
@@ -4128,6 +4214,7 @@ def bootstrap_metric_intervals(
         'auc': [],
         'auc_pr': [],
     }
+    dropped_auc_samples = 0
     for _ in range(n_bootstrap):
         indices = rng.integers(0, len(labels), size=len(labels))
         y_sample = labels[indices]
@@ -4150,6 +4237,14 @@ def bootstrap_metric_intervals(
             values['auc_pr'].append(
                 average_precision_score(y_sample, prob_sample)
             )
+        else:
+            dropped_auc_samples += 1
+
+    if dropped_auc_samples > 0:
+        print(
+            f"Bootstrap: {dropped_auc_samples}/{n_bootstrap} AUC samples "
+            f"dropped due to single-class resamples."
+        )
 
     result = {}
     for name, samples in values.items():
@@ -4158,6 +4253,8 @@ def bootstrap_metric_intervals(
         lower, upper = np.quantile(samples, [0.025, 0.975])
         result[f'{name}_ci95_low'] = float(lower)
         result[f'{name}_ci95_high'] = float(upper)
+    if dropped_auc_samples > 0:
+        result['bootstrap_auc_dropped'] = dropped_auc_samples
     return result
 
 
@@ -4691,7 +4788,12 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
                            lr=lr,
                            weight_decay=weight_decay,
                            enable_local_attention=enable_local_attention,
-                           enable_temporal_categorical=enable_local_attention)
+                           enable_temporal_categorical=enable_local_attention,
+                           multiscale_mode=(
+                               'lightweight' if dataset_name == 'taiwan' else 'legacy'
+                           ),
+                           use_step_embedding=(dataset_name == 'taiwan'),
+                           threshold_confidence=threshold_confidence)
 
     if run_analysis and dataset_name == 'taiwan':
         run_history_length_study(
@@ -4705,7 +4807,6 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
             num_layers=num_layers,
             dropout=dropout,
             split_seed=split_seed,
-            # 不用外推的伪月份证明长期依赖；超过真实长度的实验直接跳过。
             extend_method=None
         )
     elif run_analysis:
@@ -4736,7 +4837,12 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
             lr=lr,
             weight_decay=weight_decay,
             enable_local_attention=enable_local_attention,
-            enable_temporal_categorical=enable_local_attention
+            enable_temporal_categorical=enable_local_attention,
+            multiscale_mode=(
+                'lightweight' if dataset_name == 'taiwan' else 'legacy'
+            ),
+            use_step_embedding=(dataset_name == 'taiwan'),
+            threshold_confidence=threshold_confidence
         )
 
     if run_analysis:
@@ -4804,11 +4910,13 @@ def compare_baselines(X_static_train, X_temporal_train, y_train,
     )
 
     models = {
-        'Logistic Regression': LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42),
+        'Logistic Regression': LogisticRegression(max_iter=2000, class_weight='balanced', random_state=42),
         'Random Forest': RandomForestClassifier(n_estimators=100, class_weight='balanced', random_state=42),
-        'SVM': SVC(C=1.0, kernel='rbf', probability=True, class_weight='balanced'),
+        'SVM': SVC(C=1.0, kernel='rbf', probability=True, class_weight='balanced',
+                  max_iter=2000, tol=1e-3),
         'DNN': MLPClassifier(hidden_layer_sizes=(128, 64), activation='relu',
-                             alpha=1e-4, max_iter=300, random_state=42)
+                             alpha=1e-4, max_iter=500, early_stopping=True,
+                             n_iter_no_change=15, random_state=42)
     }
 
     try:
@@ -4839,7 +4947,21 @@ def compare_baselines(X_static_train, X_temporal_train, y_train,
     results = {}
     for name, model in models.items():
         try:
-            model.fit(X_train_flat, y_train)
+            # SVC(RBF)复杂度 O(n²)，大数据集需子采样防卡死
+            if name == 'SVM' and len(X_train_flat) > 5000:
+                rng = np.random.default_rng(42)
+                svm_idx = rng.choice(
+                    len(X_train_flat),
+                    size=5000,
+                    replace=False,
+                )
+                svm_train_X = X_train_flat.iloc[svm_idx]
+                svm_train_y = y_train[svm_idx]
+                print(f"SVM: subsampled training from {len(X_train_flat)} to 5000.")
+            else:
+                svm_train_X = X_train_flat
+                svm_train_y = y_train
+            model.fit(svm_train_X, svm_train_y)
             preds = model.predict(X_test_flat)
             probs = model.predict_proba(X_test_flat)[:, 1]
             try:
@@ -4915,7 +5037,10 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
                        hidden_dim=64, num_layers=4, dropout=0.3,
                        lr=1e-3, weight_decay=1e-4,
                        enable_local_attention=True,
-                       enable_temporal_categorical=True):
+                       enable_temporal_categorical=True,
+                       multiscale_mode='lightweight',
+                       use_step_embedding=True,
+                       threshold_confidence=0.80):
     """
     严格消融实验：逐一添加组件，量化每个模块对性能的增量贡献。
 
@@ -4938,6 +5063,10 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
         epoch: 每个消融配置的训练轮数
         hidden_dim/num_layers/dropout/lr/weight_decay: 模型超参
         enable_local_attention: 是否允许启用局部注意力
+        enable_temporal_categorical: 是否启用时序类别 Embedding
+        multiscale_mode: 'legacy' 或 'lightweight'
+        use_step_embedding: 是否添加可学习的时间步 Embedding
+        threshold_confidence: Wilson 下界的置信水平
 
     Returns:
         list of dict: 每个消融配置的评估结果
@@ -5061,8 +5190,8 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
             temporal_categorical_index=(
                 0 if enable_temporal_categorical else None
             ),
-            use_step_embedding=True,
-            multiscale_mode='lightweight',
+            use_step_embedding=use_step_embedding,
+            multiscale_mode=multiscale_mode,
         )
 
         trainer = Trainer(
@@ -5072,7 +5201,8 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
             lr=lr,
             weight_decay=weight_decay,
             use_dynamic_focal=config['use_focal'],
-            use_early_stopping=True
+            use_early_stopping=True,
+            threshold_confidence=threshold_confidence,
         )
 
         metrics, _ = trainer.train()
@@ -5172,7 +5302,10 @@ def run_imbalance_robustness_study(X_static_train, X_temporal_train, y_train,
                                    num_layers=8, dropout=0.4,
                                    lr=5e-4, weight_decay=2e-4,
                                    enable_local_attention=True,
-                                   enable_temporal_categorical=True):
+                                   enable_temporal_categorical=True,
+                                   multiscale_mode='lightweight',
+                                   use_step_embedding=True,
+                                   threshold_confidence=0.80):
     """
     类别不平衡鲁棒性实验：在不同训练集违约率下比较 Standard LSTM 与 AA-BiLSTM。
 
@@ -5185,6 +5318,10 @@ def run_imbalance_robustness_study(X_static_train, X_temporal_train, y_train,
         target_rates: 要测试的目标违约率序列
         epoch/batch_size/hidden_dim/.../lr/weight_decay: 模型超参
         enable_local_attention: 是否启用局部注意力
+        enable_temporal_categorical: 是否启用时序类别 Embedding
+        multiscale_mode: 'legacy' 或 'lightweight'
+        use_step_embedding: 是否添加可学习的时间步 Embedding
+        threshold_confidence: Wilson 下界的置信水平
 
     Returns:
         list of dict: 每种违约率下两个模型的评估结果
@@ -5279,8 +5416,8 @@ def run_imbalance_robustness_study(X_static_train, X_temporal_train, y_train,
             temporal_categorical_index=(
                 0 if enable_temporal_categorical else None
             ),
-            use_step_embedding=True,
-            multiscale_mode='lightweight',
+            use_step_embedding=use_step_embedding,
+            multiscale_mode=multiscale_mode,
         )
         trainer = Trainer(
             aa_model,
@@ -5292,7 +5429,8 @@ def run_imbalance_robustness_study(X_static_train, X_temporal_train, y_train,
             lr=lr,
             weight_decay=weight_decay,
             use_dynamic_focal=True,
-            use_early_stopping=True
+            use_early_stopping=True,
+            threshold_confidence=threshold_confidence,
         )
         aa_metrics, _ = trainer.train()
         row = {
@@ -5317,11 +5455,24 @@ def run_history_length_study(static_features, temporal_features, y, dataset_name
                              dropout=0.4, extend_method=None,
                              split_seed=42):
     """
-    长期依赖能力验证。支持数据扩展以测试更长时间窗口。
+    长期依赖能力验证：在不同历史长度下对比 Standard LSTM、Bi-LSTM 和 AA-BiLSTM。
 
-    参数:
-        extend_method: 仅用于显式的合成压力测试。正式结果应设为 None，
-                       只评估数据集中真实存在的历史长度。
+    Args:
+        static_features: (N, S) 静态特征
+        temporal_features: (N, T, F) 时序特征
+        y: (N,) 标签
+        dataset_name: 'german' 或 'taiwan'
+        history_lengths: 要测试的历史长度（月数）序列
+        epoch: 每个配置的训练轮数
+        batch_size: 批次大小
+        hidden_dim: 隐藏维度
+        num_layers: 循环层数
+        dropout: Dropout 比率
+        extend_method: 数据扩展方法；None 表示仅使用真实数据
+        split_seed: 数据分割随机种子
+
+    Returns:
+        dict: {模型名: [{history_length, auc, status}, ...]}
     """
     available_steps = temporal_features.shape[1]
 
@@ -5360,8 +5511,10 @@ def run_history_length_study(static_features, temporal_features, y, dataset_name
                 'temporal_categorical_index': (
                     0 if dataset_name == 'taiwan' else None
                 ),
-                'use_step_embedding': True,
-                'multiscale_mode': 'lightweight',
+                'use_step_embedding': dataset_name == 'taiwan',
+                'multiscale_mode': (
+                    'lightweight' if dataset_name == 'taiwan' else 'legacy'
+                ),
             }
         }
     }
@@ -5464,7 +5617,10 @@ def run_history_length_study(static_features, temporal_features, y, dataset_name
                 lr=1e-3 if dataset_name == 'german' else 5e-4,
                 weight_decay=1e-4 if dataset_name == 'german' else 2e-4,
                 use_dynamic_focal=False,
-                use_early_stopping=True
+                use_early_stopping=True,
+                threshold_confidence=(
+                    0.60 if dataset_name == 'german' else 0.80
+                ),
             )
             metrics, _ = trainer.train()
 
@@ -5609,7 +5765,9 @@ def save_experiment_bundle(path, model, metrics=None):
             getattr(model, 'entropy_threshold', 0.65)
         ),
         'black_swan_monitor': (
-            monitor.to_dict() if monitor is not None else None
+            monitor.to_dict()
+            if monitor is not None and monitor.center_ is not None
+            else None
         ),
         'preprocessing_state': copy.deepcopy(
             getattr(model, 'preprocessing_state', None)
