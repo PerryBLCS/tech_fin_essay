@@ -42,13 +42,35 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
+# ============================================================
+# AA-BiLSTM 信用风险预测模型 — 论文实验代码
+# ============================================================
+# 本文件实现了一篇信用风险评估论文的完整实验流程，主要包括：
+#   1. 数据加载与预处理（German Credit / Taiwan Credit 数据集）
+#   2. 模型架构：AA-BiLSTM（自适应双向 LSTM）——
+#      包含 AdaptiveFusion 融合模块、AG-ResUnit 门控残差单元、
+#      MultiScaleTemporalEncoder 多尺度时序编码器
+#   3. DynamicFocalLoss 动态焦点损失函数
+#   4. 训练器（含 Platt 概率校准、阈值搜索、EMA、混合精度）
+#   5. BlackSwanMonitor 分布外（OOD）监测器
+#   6. SHAP 可解释性分析
+#   7. 对比实验（传统 ML / 深度学习基线、消融实验、不平衡鲁棒性、
+#      历史长度敏感性）
+#
+# 运行入口：python final_essay.py --dataset german 或 --dataset taiwan
+# ============================================================
+
 GERMAN_CREDIT_URL = "https://archive.ics.uci.edu/ml/machine-learning-databases/statlog/german/german.data"
 TAIWAN_CREDIT_URL = "https://archive.ics.uci.edu/ml/machine-learning-databases/00350/default%20of%20credit%20card%20clients.xls"
 
 
-# 设置随机种子
 def set_seed(seed, deterministic=True):
-    """设置 Python、NumPy 和 PyTorch 随机种子。"""
+    """设置 Python、NumPy 和 PyTorch 随机种子，确保实验可复现。
+
+    Args:
+        seed: 随机种子值
+        deterministic: 是否启用 cuDNN 确定性模式（启用后速度略降但结果可复现）
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -59,7 +81,9 @@ def set_seed(seed, deterministic=True):
 
 
 set_seed(42)
+# 设备选择：优先使用 CUDA GPU，否则回退到 CPU
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# 启用高精度矩阵乘法（PyTorch 2.0+ 支持），提升 float32 计算精度
 if hasattr(torch, 'set_float32_matmul_precision'):
     torch.set_float32_matmul_precision('high')
 
@@ -70,7 +94,22 @@ if hasattr(torch, 'set_float32_matmul_precision'):
 
 class CreditDataLoader:
     """
-    处理 German Credit 和 Taiwan Credit 数据集
+    German Credit 和 Taiwan Credit 数据集的加载与预处理。
+
+    负责：
+    - 加载原始数据（本地文件或 UCI 在线源）
+    - 构建静态特征（数值 + one-hot 类别）和时序特征（真实月度或伪时序）
+    - 训练集拟合类别编码与 StandardScaler，避免分布信息泄漏
+    - 按 train / validation / calibration / test 四层分割数据
+    - 导出部署所需的预处理状态（特征名、缩放器参数、类别映射）
+
+    Attributes:
+        dataset_name: 数据集名称（'german' 或 'taiwan'）
+        scaler: 静态连续特征的 StandardScaler
+        temporal_scaler: 时序连续特征的 StandardScaler
+        static_feature_names: 静态特征列名列表
+        temporal_feature_names: 时序特征维度名列表
+        temporal_step_names: 时序步名列表
     """
 
     def __init__(self):
@@ -105,8 +144,21 @@ class CreditDataLoader:
 
     def load_german_credit(self, filepath=None):
         """
-        German Credit Dataset (1000样本, 20特征, 30%违约率)
-        将6个类别属性编码为伪时序数据
+        加载 German Credit 数据集（1000 样本, 20 特征, 约 30% 违约率）。
+
+        将 6 个类别属性编码为伪时序数据（category_code / risk_prior / category_frequency），
+        其余 7 个类别属性做 one-hot 编码后与 7 个数值特征合并为静态特征。
+
+        Args:
+            filepath: 本地数据文件路径，为 None 时自动从 UCI 在线下载
+
+        Returns:
+            static_features: (N, S) 静态特征矩阵
+            temporal_features: (N, 6, 3) 伪时序特征矩阵
+            y: (N,) 二分类标签（1=违约）
+
+        Raises:
+            ValueError: 数据形状不符合预期
         """
         # 如果没有提供文件路径, 使用 UCI 在线数据
         self.dataset_name = 'german'
@@ -115,11 +167,15 @@ class CreditDataLoader:
         print(f"Loading German Credit data from: {source}")
         df = pd.read_csv(source, sep=r"\s+", header=None)
 
+        # 分支 1：已预处理的 25 列格式（前 6 列为静态数值特征，
+        # 后 18 列已按 6 个类别字段 × 3 个编码维度展开为伪时序）
         if df.shape[1] == 25:
             data = df.astype(float).values
             X = data[:, :-1]
+            # German 标签：1=Good, 2=Bad → 转换为 0/1（1=违约）
             y = (data[:, -1] == 2).astype(int)
             static_features = X[:, :6].astype(np.float32)
+            # 18 列 → (N, 6步, 3通道)：category_code / risk_prior / category_frequency
             temporal_features = X[:, 6:].reshape(X.shape[0], 6, 3).astype(np.float32)
             self.static_feature_names = [f'german_static_{i}' for i in range(static_features.shape[1])]
             self.temporal_feature_names = ['category_code', 'risk_prior', 'category_frequency']
@@ -131,17 +187,23 @@ class CreditDataLoader:
             ]
             return static_features, temporal_features, y
 
+        # 分支 2：原始 UCI 21 列格式（20 特征 + 1 标签），需要手动构建特征
         if df.shape[1] != 21:
             raise ValueError(
                 f"Unexpected German Credit data shape: {df.shape}. "
                 "Expected raw german.data with 20 features + 1 label."
             )
 
+        # 标签：1=Good, 2=Bad → 0/1
         y = (df.iloc[:, -1].astype(int).values == 2).astype(int)
 
-        # 数值列索引
+        # --- 列分组 ---
+        # German Credit 的 20 个特征中：
+        #   7 个数值列（Duration, CreditAmount, InstallmentRate, ResidenceSince,
+        #               Age, ExistingCredits, NumLiable）
         numeric_cols = [1, 4, 7, 10, 12, 15, 17]
-        # 类别列索引
+        #   13 个类别列，其中 6 个用作伪时序（有明确语义且可排序），
+        #   其余 7 个做 one-hot
         categorical_cols = [0, 2, 3, 5, 6, 8, 9, 11, 13, 14, 16, 18, 19]
         pseudo_temporal_cols = [0, 2, 3, 5, 6, 8]
         static_categorical_cols = [col for col in categorical_cols if col not in pseudo_temporal_cols]
@@ -177,7 +239,15 @@ class CreditDataLoader:
         return static_features, temporal_features, y
 
     def _build_german_pseudo_temporal(self, df):
-        """基于六个分类属性构建伪时间特征"""
+        """基于六个分类属性构建伪时序特征。
+
+        German Credit 没有真实时间维度，本方法将 6 个语义不同的类别字段
+        （支票账户状态、信用历史、贷款用途、储蓄账户、就业时长、个人状态）
+        排列为"伪时间步"，每个步用三个描述符编码：
+          - category_code: 类别归一化索引 [0, 1]
+          - risk_prior: 基于领域知识的手工风险先验概率
+          - category_frequency: 类别在数据集中的出现频率
+        """
         selected_cols = [0, 2, 3, 5, 6, 8]
         self.temporal_step_names = [
             'checking_status',
@@ -194,14 +264,17 @@ class CreditDataLoader:
             for feature in self.temporal_feature_names
         ]
 
+        # 风险先验：基于 German Credit 数据集的领域知识手工设定。
+        # 值为该类别子组的经验违约概率，高值 = 高风险。
+        # 例如 A11（无支票账户）违约率 ≈ 1.00，A14（高额支票账户）≈ 0.15。
         risk_priors = {
-            0: {'A11': 1.00, 'A12': 0.65, 'A13': 0.35, 'A14': 0.15},
-            2: {'A30': 1.00, 'A31': 0.75, 'A32': 0.50, 'A33': 0.30, 'A34': 0.15},
+            0: {'A11': 1.00, 'A12': 0.65, 'A13': 0.35, 'A14': 0.15},        # 支票账户状态
+            2: {'A30': 1.00, 'A31': 0.75, 'A32': 0.50, 'A33': 0.30, 'A34': 0.15},  # 信用历史
             3: {'A40': 0.55, 'A41': 0.25, 'A42': 0.45, 'A43': 0.35, 'A44': 0.65,
-                'A45': 0.60, 'A46': 0.70, 'A48': 0.25, 'A49': 0.50, 'A410': 0.40},
-            5: {'A61': 0.90, 'A62': 0.60, 'A63': 0.40, 'A64': 0.20, 'A65': 0.50},
-            6: {'A71': 0.85, 'A72': 0.65, 'A73': 0.45, 'A74': 0.30, 'A75': 0.20},
-            8: {'A91': 0.50, 'A92': 0.45, 'A93': 0.35, 'A94': 0.30, 'A95': 0.40},
+                'A45': 0.60, 'A46': 0.70, 'A48': 0.25, 'A49': 0.50, 'A410': 0.40},  # 贷款用途
+            5: {'A61': 0.90, 'A62': 0.60, 'A63': 0.40, 'A64': 0.20, 'A65': 0.50},   # 储蓄账户
+            6: {'A71': 0.85, 'A72': 0.65, 'A73': 0.45, 'A74': 0.30, 'A75': 0.20},   # 就业时长
+            8: {'A91': 0.50, 'A92': 0.45, 'A93': 0.35, 'A94': 0.30, 'A95': 0.40},   # 个人状态/性别
         }
         self._german_selected_cols = list(selected_cols)
         self._german_risk_priors = copy.deepcopy(risk_priors)
@@ -215,23 +288,54 @@ class CreditDataLoader:
         for col in selected_cols:
             values = df[col].astype(str)
             categories = sorted(values.unique())
+            # 类别数减 1 做分母，使 code 归一化到 [0, 1]；
+            # 只有一个类别时分母为 1，避免除以零。
             denom = max(len(categories) - 1, 1)
+            # code_map: 类别值 → [0, 1] 的均匀等距编码，反映类别间的序关系
             code_map = {cat: idx / denom for idx, cat in enumerate(categories)}
+            # 频率映射：类别在数据集中出现的比例
             frequency_map = (values.value_counts() / max(n_rows, 1)).to_dict()
+            # 风险先验：仅当 col 在 risk_priors 中有定义时使用
             priors = risk_priors.get(col, {})
 
+            # 三个编码通道
             category_code = values.map(code_map).astype(float).values
+            # risk_prior 优先用先验值，未知类别退回到 code_map 值（0.5 默认）
             risk_prior = values.map(lambda v: priors.get(v, code_map.get(v, 0.5))).astype(float).values
             category_frequency = values.map(frequency_map).astype(float).values
+            # 每个类别字段 → (N, 3) 描述符
             steps.append(np.stack([category_code, risk_prior, category_frequency], axis=1))
 
+        # 6 个类别字段 → (N, 6, 3)
         return np.stack(steps, axis=1)
 
     def load_taiwan_credit(self, filepath=None):
         """
-        Taiwan Credit Card Dataset (30000样本, 24特征, 约22%违约率)
-        """
+        加载 Taiwan Credit Card 数据集（30000 样本, 24 特征, 约 22% 违约率）。
 
+        处理流程：
+        - 读取 .xls/.xlsx/.csv 文件（兼容 UCI 原始格式）
+        - 构建静态特征：基础数值特征（LIMIT_BAL, AGE）+ one-hot 类别 + 工程特征
+          （账单利用率趋势、还款冲击、逾期统计等 9 个衍生特征）
+        - 构建时序特征（6 个月 × 5 通道）：还款状态、有符号 log 账单金额、
+          有符号 log 还款金额、账单利用率、还款占账单比
+        - 时序方向统一为"最早月 → 最近月"
+        - 设置审计分组（性别、年龄段）用于公平性评估
+
+        Args:
+            filepath: 本地文件路径，为 None 时自动从 UCI 在线下载
+
+        Returns:
+            static_features: (N, S) 静态特征矩阵
+            temporal_features: (N, 6, 5) 时序特征矩阵
+            y: (N,) 二分类标签（1=违约）
+
+        Raises:
+            FileNotFoundError: 文件路径无效
+            ImportError: 缺少读取 Excel 所需的库（xlrd >= 2.0.1）
+            KeyError: 数据缺少必要列
+            RuntimeError: 读取过程出错
+        """
         # 不从 sys.argv 猜测路径；否则 `--dataset taiwan` 会被误认为文件名。
         self.dataset_name = 'taiwan'
         self.temporal_categorical_indices_ = [0]
@@ -323,31 +427,38 @@ class CreditDataLoader:
         )
 
         # 使用目标月份之前可用的六个月历史数据
+        # limit_balance 至少为 1，避免除以零
         limit_balance = np.maximum(df['LIMIT_BAL'].astype(float).values, 1.0)
-        bill_values = df[bill_cols].astype(float).values
-        payment_values = df[pay_amt_cols].astype(float).values
-        status_values = df[pay_cols].astype(float).values
+        bill_values = df[bill_cols].astype(float).values          # (N, 6) 账单金额
+        payment_values = df[pay_amt_cols].astype(float).values    # (N, 6) 还款金额
+        status_values = df[pay_cols].astype(float).values         # (N, 6) 还款状态
+
+        # --- 原始比率特征（clamp 到 ±10 防止极端值主导损失） ---
         utilization = np.clip(bill_values / limit_balance[:, None], -10.0, 10.0)
+        # 安全的 bill 绝对值，防止 payment_to_bill 被零除
         safe_bill = np.maximum(np.abs(bill_values), 1.0)
         payment_to_bill = np.clip(payment_values / safe_bill, -10.0, 10.0)
 
+        # 账单利用率趋势：将利用率按时间正序排列（最早→最近），
+        # 用 de-mean 后的时间轴做线性回归，斜率即 6 个月趋势
         chronological_bill = utilization[:, ::-1]
         trend_axis = np.arange(chronological_bill.shape[1], dtype=np.float32)
-        trend_axis -= trend_axis.mean()
+        trend_axis -= trend_axis.mean()  # 中心化，使截距不等于第 0 月的值
         trend_denominator = float(np.square(trend_axis).sum())
         bill_trend_6m = (chronological_bill @ trend_axis) / max(trend_denominator, 1e-7)
 
+        # --- 9 个工程特征（从原始 6 个月数据手工推导） ---
         engineered_static = pd.DataFrame({
-            'recent_bill_to_limit': utilization[:, 0],
-            'avg_bill_to_limit_6m': utilization.mean(axis=1),
-            'max_bill_to_limit_6m': utilization.max(axis=1),
-            'bill_trend_6m': bill_trend_6m,
-            'recent_payment_shock': status_values[:, 0] - status_values[:, 1],
-            'delinquency_count_6m': (status_values > 0).sum(axis=1),
-            'max_delinquency_6m': status_values.max(axis=1),
-            'recent_payment_to_bill': payment_to_bill[:, 0],
-            'avg_payment_to_bill_6m': payment_to_bill.mean(axis=1),
-        }).clip(-10.0, 10.0)
+            'recent_bill_to_limit': utilization[:, 0],              # 最近月账单利用率
+            'avg_bill_to_limit_6m': utilization.mean(axis=1),       # 6 月平均利用率
+            'max_bill_to_limit_6m': utilization.max(axis=1),        # 6 月最高利用率（捕捉极端透支）
+            'bill_trend_6m': bill_trend_6m,                         # 利用率线性趋势（正=恶化）
+            'recent_payment_shock': status_values[:, 0] - status_values[:, 1],  # 最近两月还款状态突变
+            'delinquency_count_6m': (status_values > 0).sum(axis=1),  # 6 月内逾期月数
+            'max_delinquency_6m': status_values.max(axis=1),        # 6 月内最高逾期级别
+            'recent_payment_to_bill': payment_to_bill[:, 0],        # 最近月还款占账单比
+            'avg_payment_to_bill_6m': payment_to_bill.mean(axis=1), # 6 月平均还款占比
+        }).clip(-10.0, 10.0)  # clamp 所有工程特征，防止极端比率破坏训练稳定性
 
         self._raw_static_numeric = pd.concat(
             [
@@ -380,20 +491,24 @@ class CreditDataLoader:
         static_features = static_df.astype(np.float32).values
         self.static_feature_names = [str(c) for c in static_df.columns]
 
-        # 原始字段顺序为“最近月 -> 最早月”；统一反转为“最早月 -> 最近月”，
+        # 时序特征构建：
+        # 原始字段顺序默认为”最近月 → 最早月”；统一反转为”最早月 → 最近月”，
         # 使局部因果窗口和趋势方向符合真实时间顺序。
-        # 金额是强长尾变量；有符号 log1p 保留方向并减少极端值的影响。
+        #
+        # 金额（bill/payment）是强长尾变量，直接输入会导致梯度被少数极端值主导；
+        # signed_log1p: sign(x) * log(1 + |x|) 保留正负方向同时压缩量级。
         bill_signal = np.sign(bill_values) * np.log1p(np.abs(bill_values))
         payment_signal = np.sign(payment_values) * np.log1p(
             np.abs(payment_values)
         )
+        # 5 通道 × 6 月，反转时间轴后得到 (N, 6, 5)
         temporal_features = np.stack([
-            status_values,
-            bill_signal,
-            payment_signal,
-            utilization,
-            payment_to_bill,
-        ], axis=-1)[:, ::-1, :].copy().astype(np.float32)  # [N, 6, 5]
+            status_values,      # 还款状态（-2~8，离散序数值）
+            bill_signal,        # 有符号 log 账单金额
+            payment_signal,     # 有符号 log 还款金额
+            utilization,        # 账单利用率
+            payment_to_bill,    # 还款占账单比
+        ], axis=-1)[:, ::-1, :].copy().astype(np.float32)
         self.temporal_feature_names = [
             'payment_status',
             'signed_log_bill_amount',
@@ -430,9 +545,6 @@ class CreditDataLoader:
             target_steps: 目标时间步数 (如 12, 24, 36)
             method: 扩展方法
                 - 'linear_trend': 基于线性趋势外推（默认）
-                - 'periodic': 周期性重复
-                - 'last_value': 保持最后值不变
-
         返回:
             扩展后的时间序列数据 (n_samples, target_steps, n_features)
         """
@@ -448,6 +560,8 @@ class CreditDataLoader:
 
         if method == 'linear_trend':
             for i in range(current_steps, target_steps):
+                # 外推衰减因子：每多推一步，置信度乘 0.85，
+                # 模拟长期预测的不确定性递增。
                 decay_factor = 0.85 ** (i - current_steps)
                 if current_steps >= 2:
                     trend = temporal_features[:, -1, :] - temporal_features[:, -2, :]
@@ -455,23 +569,25 @@ class CreditDataLoader:
                 else:
                     extended[:, i, :] = temporal_features[:, -1, :]
 
-        elif method == 'periodic':
-            repeats = int(np.ceil(target_steps / current_steps))
-            full_extended = np.tile(temporal_features, (1, repeats, 1))
-            extended = full_extended[:, :target_steps, :]
-
-        elif method == 'last_value':
-            for i in range(current_steps, target_steps):
-                extended[:, i, :] = temporal_features[:, -1, :]
-
         else:
             raise ValueError(
-                f"Unknown extension method: {method}. Choose from 'linear_trend', 'periodic', 'last_value'")
+                f"Unknown extension method: {method}. Choose from 'linear_trend'")
 
         return extended
 
     def _encode_static_from_training(self, train_idx, *evaluation_indices):
-        """使用训练集类别词表编码三个数据子集。"""
+        """使用训练集类别词表对多个数据子集做 one-hot 编码。
+
+        先对训练集拟合 one-hot 列，再对验证/校准/测试集对齐到相同列空间，
+        避免测试数据的类别信息泄漏到训练阶段。
+
+        Args:
+            train_idx: 训练样本索引
+            *evaluation_indices: 待编码的评估集索引（如 val_idx, calibration_idx, test_idx）
+
+        Returns:
+            tuple of ndarray: 各子集的编码后静态特征；无原始数据时返回 None
+        """
         if self._raw_static_numeric is None:
             return None
 
@@ -500,6 +616,8 @@ class CreditDataLoader:
         self.static_dummy_columns_ = [str(c) for c in train_dummy.columns]
 
         def combine(indices, dummy):
+            # 评估集可能缺少训练集中某些类别 → reindex 补 0，
+            # 确保所有子集的 one-hot 列顺序和维度完全一致
             aligned = dummy.reindex(
                 columns=train_dummy.columns,
                 fill_value=0.0,
@@ -522,7 +640,18 @@ class CreditDataLoader:
         train_idx,
         *evaluation_indices,
     ):
-        """训练集拟合 German 类别代码与频率，避免分布信息泄漏。"""
+        """训练集拟合 German 伪时序的类别 code/frequency，再编码全部子集。
+
+        核心思路：先用训练集的类别词表和出现频率构建 code_map 和 frequency_map，
+        然后对验证/校准/测试集使用同一套映射，防止测试数据的分布信息泄漏。
+
+        Args:
+            train_idx: 训练样本索引
+            *evaluation_indices: 待编码的评估集索引
+
+        Returns:
+            tuple of ndarray: 各子集的编码后时序特征；无 German 时序数据时返回 None
+        """
         if self._german_raw_temporal is None:
             return None
 
@@ -549,16 +678,19 @@ class CreditDataLoader:
         self.german_temporal_maps_ = maps
 
         def encode(indices):
+            """用训练集拟合的 code/frequency map 对指定索引的样本做编码。"""
             encoded_steps = []
             for step, col in enumerate(self._german_selected_cols):
                 values = raw[indices, step]
                 code_map = maps[step]['code']
                 frequency_map = maps[step]['frequency']
                 priors = self._german_risk_priors.get(col, {})
+                # 训练集中未见过的类别 → code 默认 0.5（中间值）
                 category_code = np.asarray(
                     [code_map.get(value, 0.5) for value in values],
                     dtype=np.float32,
                 )
+                # 先验未知 → 回退到 code_map 值（默认 0.5）
                 risk_prior = np.asarray(
                     [
                         priors.get(value, code_map.get(value, 0.5))
@@ -566,6 +698,7 @@ class CreditDataLoader:
                     ],
                     dtype=np.float32,
                 )
+                # 训练集中未见过的类别 → frequency 默认 0.0
                 category_frequency = np.asarray(
                     [frequency_map.get(value, 0.0) for value in values],
                     dtype=np.float32,
@@ -582,6 +715,11 @@ class CreditDataLoader:
 
     @staticmethod
     def _scaler_state(scaler):
+        """导出 StandardScaler 的拟合参数，用于部署时复现完全相同的缩放。
+
+        mean_/scale_ → 标准化公式 x' = (x - mean)/scale；
+        n_samples_seen_ → 在线部署时如需增量更新 scaler 可继续累加。
+        """
         if not hasattr(scaler, 'mean_'):
             return None
         return {
@@ -646,7 +784,28 @@ class CreditDataLoader:
         split_seed=42,
     ):
         """
-        数据预处理: 标准化、分割
+        数据预处理主流程：分层分割 + 编码 + 标准化。
+
+        流程：
+        1. 输入验证（形状、有限性、二分类标签）
+        2. 按 train / validation / calibration / test 四层分层分割
+        3. 训练集拟合类别 one-hot 词表，其他集对齐
+        4. 训练集拟合 StandardScaler，只对连续列做标准化
+        5. 训练集拟合时序缩放器，对评估集做 transform
+
+        Args:
+            static_features: (N, S) 静态特征
+            temporal_features: (N, T, F) 时序特征
+            y: (N,) 二分类标签
+            test_size: 测试集比例
+            val_size: 验证集比例
+            calibration_size: Platt 校准集比例
+            split_seed: 分层分割随机种子
+
+        Returns:
+            12 元组: (X_static_train, X_temporal_train, y_train,
+                       X_static_val, X_temporal_val, y_val,
+                       X_static_test, X_temporal_test, y_test)
         """
         static_features = np.asarray(static_features, dtype=np.float32)
         temporal_features = np.asarray(temporal_features, dtype=np.float32)
@@ -676,25 +835,33 @@ class CreditDataLoader:
                 "and sum to less than 1."
             )
 
-        # 先分割样本索引，再拟合类别词表、频率和 scaler。
+        # 分层分割顺序：先切 test，再从剩余 development 中切 train / (val+calibration)，
+        # 最后在 operating 中把 calibration 从 val 中分离出来。
+        # 每步 test_size 需按当前剩余比例换算，确保最终四子集比例精确匹配：
+        #   test = test_size（全局比例）
+        #   val = (1-test_size) * heldout_fraction（development 内的 val 比例）
+        #   calibration = (1-test_size) * calibration_fraction（development 内的 cal 比例）
         all_indices = np.arange(len(y))
+        # 第一步：切出测试集
         development_idx, test_idx = train_test_split(
             all_indices,
             test_size=test_size,
             random_state=split_seed,
             stratify=y,
         )
+        # 第二步：在 development 中切出训练集和操作集（val+calibration）
         heldout_fraction = val_size + calibration_size
         train_idx, operating_idx = train_test_split(
             development_idx,
-            test_size=heldout_fraction / (1.0 - test_size),
+            test_size=heldout_fraction / (1.0 - test_size),  # 换算到 development 内部的相对比例
             random_state=split_seed + 1,
             stratify=y[development_idx],
         )
+        # 第三步：在 operating 中分离验证集和校准集
         calibration_fraction = calibration_size / heldout_fraction
         val_idx, calibration_idx = train_test_split(
             operating_idx,
-            test_size=calibration_fraction,
+            test_size=calibration_fraction,  # operating 内部校准集相对占比
             random_state=split_seed + 2,
             stratify=y[operating_idx],
         )
@@ -763,6 +930,8 @@ class CreditDataLoader:
             )
         }
 
+        # 区分 binary/continuous 列：one-hot 列值只有 0 和 1，
+        # 不应被 StandardScaler 缩放（会破坏语义）；只对连续列做标准化。
         binary_static_cols = np.all((X_static_train == 0) | (X_static_train == 1), axis=0)
         continuous_static_cols = ~binary_static_cols
         self.continuous_static_cols_ = continuous_static_cols.copy()
@@ -771,6 +940,7 @@ class CreditDataLoader:
             X_static_val = X_static_val.copy()
             X_static_calibration = X_static_calibration.copy()
             X_static_test = X_static_test.copy()
+            # train 集上 fit_transform，其余集仅 transform（防止信息泄漏）
             X_static_train[:, continuous_static_cols] = self.scaler.fit_transform(
                 X_static_train[:, continuous_static_cols]
             )
@@ -788,6 +958,8 @@ class CreditDataLoader:
 
         n_train, time_steps, n_features = X_temporal_train.shape
         self.temporal_scaler = StandardScaler()
+        # 时序特征中可能含类别通道（如 Taiwan 的 PAY 状态），
+        # 这些通道不应被标准化。continuous_temporal_cols 标记哪些通道可缩放。
         continuous_temporal_cols = np.ones(n_features, dtype=bool)
         for categorical_index in self.temporal_categorical_indices_:
             if not 0 <= categorical_index < n_features:
@@ -798,6 +970,11 @@ class CreditDataLoader:
         self.continuous_temporal_cols_ = continuous_temporal_cols.copy()
 
         def scale_temporal(x, fit=False):
+            """对 (N, T, F) 的时序特征按通道缩放。
+
+            将 (N*T, F_continuous) 展平后做 StandardScaler，
+            再恢复为 (N, T, F)，保证每个时间步使用相同的缩放参数。
+            """
             result = x.astype(np.float32, copy=True)
             if not np.any(continuous_temporal_cols):
                 return result
@@ -805,6 +982,9 @@ class CreditDataLoader:
                 -1,
                 int(continuous_temporal_cols.sum()),
             )
+            # (N*T, F_cont) 展平 → 缩放 → 恢复回 (N, T, F_cont)，
+            # 再按 continuous_temporal_cols 掩码写回原始 (N, T, F) 矩阵中对应列。
+            # 类别通道（如 PAY 状态）保持原值不变。
             scaled = (
                 self.temporal_scaler.fit_transform(reshaped)
                 if fit else self.temporal_scaler.transform(reshaped)
@@ -849,7 +1029,15 @@ class CreditDataLoader:
 
 
 class CreditDataset(Dataset):
-    """用于信用风险数据的 PyTorch 数据集"""
+    """用于信用风险数据的 PyTorch Dataset。
+
+    每个样本返回一个字典：{'static': (S,), 'temporal': (T, F), 'label': scalar}
+
+    Args:
+        static_features: (N, S) 静态特征
+        temporal_features: (N, T, F) 时序特征
+        labels: (N,) 标签
+    """
 
     def __init__(self, static_features, temporal_features, labels):
         self.static_features = torch.FloatTensor(static_features)
@@ -890,6 +1078,22 @@ class BlackSwanMonitor:
 
     @staticmethod
     def _descriptors(static_features, temporal_features):
+        """构建监测描述符矩阵。
+
+        对每个样本提取 8 组统计量作为 OOD 检测的输入：
+        - 静态特征（直接拼接）
+        - 时序均值、标准差、最大值、最小值（全局状态）
+        - 最后一个时间步的原始值（最近状态）
+        - 首尾差值（趋势）
+        - 相邻时间步的最大绝对差值（突变强度）
+
+        Args:
+            static_features: (N, S) 静态特征
+            temporal_features: (N, T, F) 时序特征
+
+        Returns:
+            (N, S + 7*F) 描述符矩阵
+        """
         static_features = np.asarray(static_features, dtype=np.float32)
         temporal_features = np.asarray(temporal_features, dtype=np.float32)
         if static_features.ndim != 2:
@@ -924,6 +1128,18 @@ class BlackSwanMonitor:
         ], axis=1)
 
     def _raw_scores(self, descriptors):
+        """计算异常分数：top-k 平均 robust z-score。
+
+        对每个样本取其描述符各维度的 robust z-score 绝对值，
+        保留最大的 top_fraction 比例的维度取均值作为该样本的异常分数。
+        这样比全维度平均更能捕获少数维度上的极端偏离。
+
+        Args:
+            descriptors: (N, D) 描述符矩阵
+
+        Returns:
+            (N,) 异常分数向量
+        """
         robust_z = np.abs(
             (descriptors - self.center_) / self.scale_
         )
@@ -931,12 +1147,20 @@ class BlackSwanMonitor:
             1,
             int(np.ceil(robust_z.shape[1] * self.top_fraction))
         )
+        # np.partition 做部分排序：第 (D - top_k) 个位置之后全是最大的 top_k 个值
+        # 复杂度 O(D) vs 完整排序 O(D log D)，在特征维度大时显著更快
         partitioned = np.partition(
             robust_z, robust_z.shape[1] - top_k, axis=1
         )
-        return partitioned[:, -top_k:].mean(axis=1)
+        return partitioned[:, -top_k:].mean(axis=1)  # top-k 维度的均值作为异常分数
 
     def fit(self, static_features, temporal_features):
+        """用训练集拟合 OOD 监测器中心、尺度和阈值。
+
+        Args:
+            static_features: (N_train, S) 训练集静态特征
+            temporal_features: (N_train, T, F) 训练集时序特征
+        """
         descriptors = self._descriptors(
             static_features, temporal_features
         )
@@ -944,6 +1168,11 @@ class BlackSwanMonitor:
         mad = np.median(
             np.abs(descriptors - self.center_), axis=0
         )
+        # 1.4826 = 1 / Φ^{-1}(3/4)，将 MAD 转换为正态分布标准差的一致估计
+        # 三级回退缩放估计：
+        # 1. 首选 MAD→robust_scale（对异常值鲁棒，但 MAD 可能为 0 于常数特征）
+        # 2. robust_scale≈0 → 退回到普通 std（有偏但对常数特征有效）
+        # 3. std≈0 → 退回到 1.0（常数特征不做缩放，仅靠中心化检测偏离）
         robust_scale = 1.4826 * mad
         fallback_scale = descriptors.std(axis=0)
         self.scale_ = np.where(
@@ -958,6 +1187,15 @@ class BlackSwanMonitor:
         return self
 
     def score(self, static_features, temporal_features):
+        """计算新样本的 OOD 异常分数并标记异常。
+
+        Args:
+            static_features: (N, S) 静态特征
+            temporal_features: (N, T, F) 时序特征
+
+        Returns:
+            (scores, flags): scores 为 (N,) 异常分数，flags 为 (N,) bool 标记
+        """
         if self.center_ is None or self.scale_ is None:
             raise RuntimeError("BlackSwanMonitor must be fitted first.")
         descriptors = self._descriptors(
@@ -1010,84 +1248,25 @@ class BlackSwanMonitor:
 # 2. 模型架构定义
 # ==============================
 
-class TSCrossAttention(nn.Module):
+class AdaptiveFusion(nn.Module):
+
     """
-    时序-静态特征交叉注意力机制 (TS-CrossAttention)
+    自适应全局-局部门控融合（Adaptive Global-Local Fusion）。
 
-    静态特征作为 Query 查询时序关键节点；时序摘要作为 Query 反向查询
-    静态特征，最后拼接两个方向的上下文表示。
-    """
+    全局分支通过多统计量（mean/max/last/std/trend + static + multi-scale context）
+    非线性聚合建模长期信用状态。局部分支仅在固定因果窗口内计算冲击注意力，
+    显式编码相邻时间步的突变，配合 event_encoder 捕获 [当前值, 一阶差分, 差分绝对值]
+    三种局部冲击信号。最终通过可学习门控残差方式注入原始时序，
+    不替代或抹平序列信息。
 
-    def __init__(self, static_dim, temporal_dim, hidden_dim=64, num_heads=4,
-                 dropout=0.1):
-        super().__init__()
-        if hidden_dim % num_heads != 0:
-            raise ValueError("hidden_dim must be divisible by num_heads for multi-head attention.")
+    局部注意力权重形状为 [B, T, W]（W=固定窗口，默认 3）。
 
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
-
-        self.static_query_proj = nn.Linear(static_dim, hidden_dim)
-        self.temporal_token_proj = nn.Linear(temporal_dim, hidden_dim)
-        self.temporal_query_proj = nn.Linear(temporal_dim, hidden_dim)
-        self.static_key_proj = nn.Linear(static_dim, hidden_dim)
-        self.static_value_proj = nn.Linear(static_dim, hidden_dim)
-
-        self.static_to_temporal_attn = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-        # 单令牌静态 Key/Value 使得 softmax 注意力恒等于 1
-        # 使用时序条件门控，确保反向时序交互具有实际意义
-        self.reverse_gate = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.Sigmoid()
-        )
-
-        self.output_proj = nn.Linear(hidden_dim * 2, hidden_dim)
-
-    def forward(self, static_feat, temporal_feat):
-        """
-        Args:
-            static_feat: [batch, static_dim]
-            temporal_feat: [batch, time_steps, temporal_dim]
-        Returns:
-            fused_feat: [batch, hidden_dim]
-            attention_weights: [batch, context_steps]
-        """
-        temporal_tokens = self.temporal_token_proj(temporal_feat)
-        q_static = self.static_query_proj(static_feat).unsqueeze(1)
-        c_s2x, alpha = self.static_to_temporal_attn(
-            q_static,
-            temporal_tokens,
-            temporal_tokens,
-            need_weights=True
-        )
-
-        temporal_summary = temporal_feat.mean(dim=1)
-        q_temporal = self.temporal_query_proj(temporal_summary).unsqueeze(1)
-        static_key = self.static_key_proj(static_feat).unsqueeze(1)
-        static_value = self.static_value_proj(static_feat).unsqueeze(1)
-        reverse_gate = self.reverse_gate(
-            torch.cat([q_temporal.squeeze(1), static_key.squeeze(1)], dim=-1)
-        )
-        c_x2s = (reverse_gate * static_value.squeeze(1)).unsqueeze(1)
-
-        fused = torch.cat([c_s2x.squeeze(1), c_x2s.squeeze(1)], dim=-1)
-        return self.output_proj(fused), alpha.squeeze(1)
-
-
-class NonlinearGlobalLocalFusion(nn.Module):
-    """
-    非线性全局-局部门控融合（NGL-GF）。
-
-    全局分支通过多统计量非线性聚合建模长期信用状态；局部分支仅在固定
-    因果窗口内计算加性注意力，并显式编码相邻时间步突变。最终以门控
-    残差方式注入原始时序，因此不会用单一聚合向量替代或抹平原始序列。
-
-    局部注意力权重形状为 [B, T, W]，W 为固定窗口，避免 T x T 矩阵。
+    Args:
+        hidden_dim: 隐藏维度
+        window_size: 局部注意力因果窗口大小
+        dropout: Dropout 比率
+        use_global_context: 是否启用全局上下文分支
+        use_local_attention: 是否启用局部冲击注意力分支
     """
 
     def __init__(self, hidden_dim, window_size=3, dropout=0.1,
@@ -1102,11 +1281,14 @@ class NonlinearGlobalLocalFusion(nn.Module):
         self.window_size = int(window_size)
         self.use_global_context = use_global_context
         self.use_local_attention = use_local_attention
-        # 低秩瓶颈控制参数量；在 d=64/128 时显著少于旧版多头交叉注意力。
+        # 低秩瓶颈：将中间表示压缩到 hidden_dim/4，显著减少门控网络参数量。
+        # d=64 时 bottleneck=16，d=128 时 bottleneck=32。
         bottleneck = max(hidden_dim // 4, 8)
 
         if use_global_context:
-            # mean/max/last/std/trend + static context + multi-scale context
+            # 全局编码输入 = 5 个时序统计量 + 静态特征 + 多尺度上下文
+            # = mean/max/last/std/trend (5×hidden_dim) + static (hidden_dim) + multiscale (hidden_dim)
+            # = 7 × hidden_dim
             self.global_encoder = nn.Sequential(
                 nn.Linear(hidden_dim * 7, bottleneck),
                 nn.GELU(),
@@ -1118,16 +1300,20 @@ class NonlinearGlobalLocalFusion(nn.Module):
             self.global_encoder = None
 
         if use_local_attention:
-            # [current, signed change, absolute change] preserves local shocks.
+            # 事件编码器：将 [当前值, 一阶差分, 差分绝对值] 三个视角融合为局部冲击表示
             self.event_encoder = nn.Sequential(
                 nn.Linear(hidden_dim * 3, bottleneck),
                 nn.GELU(),
                 nn.Linear(bottleneck, hidden_dim),
                 nn.LayerNorm(hidden_dim)
             )
+            # query: 融合时序当前值 + 静态 + 全局上下文 → 决定"关注什么"
             self.local_query = nn.Linear(hidden_dim * 3, bottleneck)
+            # key: 窗口内每个 token 的表示 → 决定"被关注什么"
             self.local_key = nn.Linear(hidden_dim, bottleneck)
+            # score: 单标量输出（bias=False 避免学习到常数偏向）
             self.local_score = nn.Linear(bottleneck, 1, bias=False)
+            # value: 加权聚合前的值投影
             self.local_value = nn.Linear(hidden_dim, hidden_dim)
         else:
             self.event_encoder = None
@@ -1136,18 +1322,27 @@ class NonlinearGlobalLocalFusion(nn.Module):
             self.local_score = None
             self.local_value = None
 
+        # 门控输入维度 = 5×hidden_dim + 1：
+        #   temporal_feat, local_context, global_expanded,
+        #   temporal×global（元素乘积交互）, |temporal-global|（差异），
+        #   shock_score（单通道冲击强度）
         gate_input_dim = hidden_dim * 5 + 1
         self.gate_network = nn.Sequential(
             nn.Linear(gate_input_dim, bottleneck),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(bottleneck, hidden_dim * 2)
+            nn.Linear(bottleneck, hidden_dim * 2)  # 输出 local_gate 和 global_gate 各 hidden_dim 维
         )
         self.output_dropout = nn.Dropout(dropout)
         self.output_norm = nn.LayerNorm(hidden_dim)
 
     @staticmethod
     def _temporal_statistics(temporal_feat):
+        """提取时序的五种全局统计量。
+
+        Returns:
+            (mean, maximum, last, std, trend) 五元组，每个形状为 (B, hidden_dim)
+        """
         mean = temporal_feat.mean(dim=1)
         maximum = temporal_feat.max(dim=1).values
         last = temporal_feat[:, -1]
@@ -1157,13 +1352,41 @@ class NonlinearGlobalLocalFusion(nn.Module):
 
     @staticmethod
     def _causal_window_mask(time_steps, window_size, device):
-        positions = torch.arange(window_size, device=device).unsqueeze(0)
+        """构建因果注意力掩码，确保每个时间步只能看到当前及之前的窗口位置。
+
+        返回 (window_size, time_steps) 的 bool 矩阵：
+          mask[w, t] = True 当且仅当窗口位置 w 对时间步 t 可见。
+
+        例：window_size=3, time_steps=5 时：
+          位置 0(t-2) 位置 1(t-1) 位置 2(t)
+        t=0:   F          F          T     (只能看当前)
+        t=1:   F          T          T     (看当前和前1步)
+        t>=2:  T          T          T     (完整窗口)
+
+        推导：对于时间步 t，可见的最小窗口位置 = window_size - 1 - t，
+        即位置 w 可见 ⇔ w >= window_size - 1 - t。
+        """
+        positions = torch.arange(window_size, device=device).unsqueeze(0)   # (1, W)
         first_valid = window_size - 1 - torch.arange(
             time_steps, device=device
-        ).unsqueeze(1)
-        return positions >= first_valid
+        ).unsqueeze(1)                                                       # (T, 1)
+        return positions >= first_valid                                      # (T, W)
 
     def _local_context(self, temporal_feat, static_feat, global_context):
+        """在因果窗口内计算局部冲击注意力。
+
+        步骤：
+        1. 计算一阶差分 delta 和冲击强度 shock_score
+        2. event_encoder 将 [当前值, delta, |delta|] 编码为 event token
+        3. 展开因果窗口，query 融合时序/静态/全局上下文后对窗口内 token 打分
+        4. softmax 加权聚合得到局部上下文表示
+
+        Returns:
+            (local_context, attention_weights, shock_score):
+            - local_context: (B, T, hidden_dim) 局部上下文
+            - attention_weights: (B, T, W) 注意力权重
+            - shock_score: (B, T) 每步冲击强度
+        """
         batch_size, time_steps, hidden_dim = temporal_feat.shape
 
         delta = torch.zeros_like(temporal_feat)
@@ -1177,10 +1400,16 @@ class NonlinearGlobalLocalFusion(nn.Module):
             torch.cat([temporal_feat, delta, delta.abs()], dim=-1)
         )
 
+        # 因果窗口展开：先在时间维左端补 window_size-1 个零 token，
+        # 使第 0 步也能"看到"一个完整窗口（前面是 padding 的零），
+        # 再 unfold 出每个时间步对应的 W 个连续 token。
+        # 变换链：
+        #   pad:     (B, T, D) → (B, T+W-1, D)  左端补零
+        #   unfold:  (B, T+W-1, D) → (B, T, D, W)  沿时间维滑窗
+        #   permute: (B, T, D, W) → (B, T, W, D)  W 维移到 D 前，方便后续 batch matmul
         window_size = min(self.window_size, time_steps)
-        padded = F.pad(event_tokens, (0, 0, window_size - 1, 0))
-        # unfold returns [B, T, D, W]; move the local-window axis before D.
-        windows = padded.unfold(1, window_size, 1).permute(0, 1, 3, 2)
+        padded = F.pad(event_tokens, (0, 0, window_size - 1, 0))  # (0,0)=不补D, (W-1,0)=左补W-1右补0
+        windows = padded.unfold(1, window_size, 1).permute(0, 1, 3, 2)  # → (B, T, W, D)
 
         static_context = static_feat.unsqueeze(1).expand(
             batch_size, time_steps, hidden_dim
@@ -1188,13 +1417,16 @@ class NonlinearGlobalLocalFusion(nn.Module):
         global_expanded = global_context.unsqueeze(1).expand(
             batch_size, time_steps, hidden_dim
         )
+        # query: (B, T, 1, bottleneck) — unsqueeze(2) 插入窗口维用于与
+        #   key(windows): (B, T, W, bottleneck) 做 broadcasting 加法
+        # additive attention: score = linear(tanh(query + key))
         query = self.local_query(
             torch.cat([temporal_feat, static_context, global_expanded], dim=-1)
         ).unsqueeze(2)
 
         scores = self.local_score(
             torch.tanh(query + self.local_key(windows))
-        ).squeeze(-1)
+        ).squeeze(-1)  # → (B, T, W)
         valid_mask = self._causal_window_mask(
             time_steps, window_size, temporal_feat.device
         )
@@ -1209,6 +1441,18 @@ class NonlinearGlobalLocalFusion(nn.Module):
         return local_context, attention_weights, shock_score
 
     def forward(self, static_feat, temporal_feat, multi_scale_context=None):
+        """前向传播：全局聚合 + 局部冲击注意力 + 门控残差融合。
+
+        Args:
+            static_feat: (B, hidden_dim) 静态特征嵌入
+            temporal_feat: (B, T, hidden_dim) 投影后的时序特征
+            multi_scale_context: (B, multi_scale_dim) 多尺度上下文，可选
+
+        Returns:
+            (fused_sequence, diagnostics):
+            - fused_sequence: (B, T, hidden_dim) 融合后的时序特征
+            - diagnostics: dict 含 local_attention/局部门/全局门/shock_score 等诊断信息
+        """
         batch_size, time_steps, hidden_dim = temporal_feat.shape
         if hidden_dim != self.hidden_dim:
             raise ValueError(
@@ -1244,6 +1488,8 @@ class NonlinearGlobalLocalFusion(nn.Module):
             shock_score = (delta.square().mean(dim=-1) + 1e-8).sqrt()
 
         global_expanded = global_context.unsqueeze(1).expand_as(temporal_feat)
+        # shock_score 始终计算（用于 diagnostics），但仅在启用局部注意力时
+        # 才注入门控网络；否则门控输入的 shock 通道置零。
         gate_shock = (
             shock_score
             if self.use_local_attention
@@ -1303,18 +1549,22 @@ class AdaptiveGatedResUnit(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
 
-        # 四个标准门共用一次矩阵乘法，保持公式不变并显著减少 kernel launch。
+        # 四个标准门 f/i/o/c 共用一次矩阵乘法输出 4×hidden_dim，
+        # 减少 GPU kernel launch 次数（4 次 → 1 次），提升训练吞吐。
         self.gate_projection = nn.Linear(
             input_dim + hidden_dim,
             hidden_dim * 4,
         )
 
-        # 自适应门控系数 λ：由当前输入和历史状态动态生成，而不是全局常数
+        # 自适应门控系数 λ：由当前输入和历史状态动态生成，每个样本每步独立。
+        # λ ∈ [0,1]，通过 sigmoid 约束；λ 大 → 偏记忆，λ 小 → 偏更新。
         self.lambda_gate = nn.Sequential(
             nn.Linear(input_dim + hidden_dim, hidden_dim),
             nn.Sigmoid()
         )
-        # 初始时接近标准门控，训练后再逐步学习更强的长期记忆偏置。
+        # bias 初始化为 -1.5 → sigmoid(-1.5) ≈ 0.18，
+        # 即训练初期 λ ≈ 0.18，接近标准 LSTM 门控行为，
+        # 训练后期 λ 可随梯度上升，逐步引入更强的长期记忆。
         nn.init.constant_(self.lambda_gate[0].bias, -1.5)
 
         # 残差投影 (当输入维度不等于隐藏维度时)
@@ -1333,23 +1583,26 @@ class AdaptiveGatedResUnit(nn.Module):
         # 拼接输入和隐藏状态
         combined = torch.cat([x, h_prev], dim=-1)  # 在最后一维进行拼接
 
-        # 原始门控计算；一次线性投影后再分块。
+        # 原始门控一次投影后分 4 块（各 hidden_dim 维）
         f_raw, i_raw, o_raw, c_raw = self.gate_projection(combined).chunk(
             4,
             dim=-1,
         )
-        f_tilde = torch.sigmoid(f_raw)
-        i_tilde = torch.sigmoid(i_raw)
-        o_tilde = torch.sigmoid(o_raw)
+        f_tilde = torch.sigmoid(f_raw)   # 遗忘门基础值
+        i_tilde = torch.sigmoid(i_raw)   # 输入门基础值
+        o_tilde = torch.sigmoid(o_raw)   # 输出门
 
-        # 自适应门控: λ 随样本和时间状态变化，λ 越大越偏记忆，越小越偏更新
+        # 自适应门控系数：λ 越大 → 遗忘门越偏向 1（保留旧记忆），
+        #                输入门越偏向 0（抑制新信息），即更偏”记忆”模式。
         lambda_val = self.lambda_gate(combined)
 
         # 候选细胞状态
         c_tilde = torch.tanh(c_raw)
 
-        # lambda 越大越偏向保留旧记忆；原实现只是交换 f/i 两个门，
-        # 并不能保证注释所描述的“偏记忆/偏更新”行为。
+        # λ 调制后的有效门控：
+        # - f_t: λ=0 → f_tilde（标准遗忘），λ=1 → 1（完全保留）
+        # - i_t: λ=0 → i_tilde（标准输入），λ=1 → 0（完全阻断新信息）
+        # - o_t 不受 λ 影响，保持标准输出门行为
         f_t = lambda_val + (1.0 - lambda_val) * f_tilde
         i_t = (1.0 - lambda_val) * i_tilde
         o_t = o_tilde
@@ -1374,7 +1627,18 @@ class AdaptiveGatedResUnit(nn.Module):
 
 class AGBiLSTMLayer(nn.Module):
     """
-    基于 AG-ResUnit 的 LSTM 层，可切换单向/双向以支持真实消融实验。
+    基于 AG-ResUnit 的多层门控 LSTM 层。
+
+    支持切换 单向/双向 以支持消融实验中分别评估 AG-ResUnit 和 Bi-Directional
+    各自的贡献。多层之间通过逐层传递隐藏状态堆叠，每层可选择独立的
+    AdaptiveGatedResUnit 实例。
+
+    Args:
+        input_dim: 输入维度
+        hidden_dim: 隐藏维度
+        num_layers: AG-ResUnit 堆叠层数
+        dropout: 层间 dropout 比率
+        bidirectional: 是否开启双向时序处理
     """
 
     def __init__(self, input_dim, hidden_dim, num_layers=2, dropout=0.3, bidirectional=True):
@@ -1397,6 +1661,19 @@ class AGBiLSTMLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def _run_direction(self, x, layers, reverse=False):
+        """按指定方向逐层运行 AG-ResUnit 堆叠。
+
+        每层独立维护隐藏/细胞状态对 (h, c)，按时间步迭代更新。
+        多层之间将上一层的隐藏状态作为下一层的输入。
+
+        Args:
+            x: (B, T, input_dim) 输入序列
+            layers: nn.ModuleList 中的 AG-ResUnit 层列表
+            reverse: True 表示从 T-1 向 0 反向迭代
+
+        Returns:
+            (B, T, hidden_dim) 该方向最后一层所有时间步的输出
+        """
         batch_size, time_steps, _ = x.shape
 
         def init_states():
@@ -1441,10 +1718,23 @@ class AGBiLSTMLayer(nn.Module):
 
 class MultiScaleTemporalEncoder(nn.Module):
     """
-    多尺度时序编码器
-    - 细粒度（月度）：原始月频数据
-    - 中粒度（季度）：3个月滑动平均
-    - 粗粒度（年度）：12个月滑动窗口；不足12个月时退化为全局趋势摘要
+    多尺度时序编码器。
+
+    在三个时间尺度上分别提取表示：
+    - 细粒度（月度）：原始月频数据的统计量 / BiLSTM 编码
+    - 中粒度（季度）：3 个月滑动平均后编码
+    - 粗粒度（年度）：12 个月滑动窗口编码；不足 12 个月时退化为全局趋势摘要
+
+    支持两种模式：
+    - 'legacy'：每个尺度用独立 BiLSTM 编码（适合小数据集如 German）
+    - 'lightweight'：用统计量 + Conv1d 平滑替代 BiLSTM（参数更少，适合 Taiwan）
+
+    Args:
+        input_dim: 时序特征维度
+        hidden_dim: 单方向隐藏维度（输出为 2*hidden_dim）
+        coarse_window: 粗粒度滑动窗口大小（默认 12）
+        max_steps: 最大时间步数（用于判断 coarse_encoder 是否启用）
+        mode: 'legacy' 或 'lightweight'
     """
 
     def __init__(
@@ -1498,11 +1788,13 @@ class MultiScaleTemporalEncoder(nn.Module):
                 nn.GELU(),
                 nn.LayerNorm(hidden_dim * 2),
             )
+            # 分组卷积（groups=input_dim）→ 每个通道独立做 1D 卷积
+            # 权重初始化为 1/3 → 等价于 3 个月简单滑动平均（不学习）
             self.medium_filter = nn.Conv1d(
                 input_dim,
                 input_dim,
                 kernel_size=3,
-                groups=input_dim,
+                groups=input_dim,   # 逐通道独立卷积，不混合通道
                 bias=False,
             )
             nn.init.constant_(self.medium_filter.weight, 1.0 / 3.0)
@@ -1524,9 +1816,20 @@ class MultiScaleTemporalEncoder(nn.Module):
 
     @staticmethod
     def _moving_average(x, window, padding=0):
+        """时序滑动平均（沿时间维）。
+
+        Args:
+            x: (B, T, D) 输入序列
+            window: 窗口大小
+            padding: 边界填充量（0=valid 无填充；1=replicate 左右各补 1，保持时间对齐）
+                     padding=1 时：左补 1、右补 window-2，使滑动窗口中心对齐当前步
+
+        Returns:
+            (B, T, D) 平滑后序列
+        """
         if padding:
             left = padding
-            right = window - 1 - left
+            right = window - 1 - left  # 总 padding = window-1，使输出长度 = 输入长度
             x = F.pad(
                 x.transpose(1, 2),
                 (left, right),
@@ -1542,11 +1845,26 @@ class MultiScaleTemporalEncoder(nn.Module):
 
     @staticmethod
     def _bidirectional_state(hidden_state):
-        """使用 BiLSTM 的完整前向和后向历史信息"""
+        """从 BiLSTM 最终隐藏状态中提取前向+后向拼接表示。
+
+        Args:
+            hidden_state: BiLSTM 的 h_n，(num_layers*2, B, hidden_dim)
+
+        Returns:
+            (B, hidden_dim*2) 前向最终状态与后向最终状态的拼接
+        """
         return torch.cat([hidden_state[-2], hidden_state[-1]], dim=-1)
 
     @staticmethod
     def _statistics(x):
+        """提取时序的 lightweight 统计量：level（均值）、recent（末值）、trend（首尾差/步数）。
+
+        Args:
+            x: (B, T, D) 输入序列
+
+        Returns:
+            (B, D*3) 拼接后的统计量
+        """
         time_steps = x.shape[1]
         level = x.mean(dim=1)
         recent = x[:, -1, :]
@@ -1563,12 +1881,13 @@ class MultiScaleTemporalEncoder(nn.Module):
         if self.mode == 'lightweight':
             fine_repr = self.fine_projection(self._statistics(x))
             if time_steps >= 3:
+                # Conv1d 需要 (B, D, T) 输入；先 transpose→pad→conv→transpose 回 (B, T, D)
                 padded = F.pad(
-                    x.transpose(1, 2),
-                    (1, 1),
+                    x.transpose(1, 2),       # (B, T, D) → (B, D, T)
+                    (1, 1),                   # 时间维左右各补 1（replicate 边界值）
                     mode='replicate',
                 )
-                medium_x = self.medium_filter(padded).transpose(1, 2)
+                medium_x = self.medium_filter(padded).transpose(1, 2)  # 卷积后转回 (B, T, D)
             else:
                 medium_x = x
             medium_repr = self.medium_projection(
@@ -1595,9 +1914,12 @@ class MultiScaleTemporalEncoder(nn.Module):
             _, (coarse_hidden, _) = self.coarse_encoder(coarse_x)
             coarse_repr = self._bidirectional_state(coarse_hidden)
         else:
-            level = x.mean(dim=1, keepdim=True)
-            trend = (x[:, -1:, :] - x[:, :1, :]) / max(time_steps - 1, 1)
-            coarse_stats = torch.cat([level, trend], dim=-1)
+            # 短序列回退：时间步不足以做 coarse_window 滑窗时，
+            # 用全序列 level（均值）和 trend（首尾差/步数）两个统计量
+            # 经 Linear 投影生成粗粒度表示，避免 BiLSTM 在 <2 步输入上崩溃
+            level = x.mean(dim=1, keepdim=True)    # (B, 1, D)
+            trend = (x[:, -1:, :] - x[:, :1, :]) / max(time_steps - 1, 1)  # 归一化趋势
+            coarse_stats = torch.cat([level, trend], dim=-1)  # (B, 1, 2*D)
             coarse_repr = self.coarse_fallback(coarse_stats.squeeze(1))
 
         multi_scale = torch.cat([fine_repr, medium_repr, coarse_repr], dim=-1)
@@ -1605,50 +1927,61 @@ class MultiScaleTemporalEncoder(nn.Module):
 
 
 class AABiLSTM(nn.Module):
+
     """
-    非线性全局-局部自适应双向 LSTM 融合模型。
+    自适应双向 LSTM 信用风险模型（AA-BiLSTM）。
 
-    完整架构:
-    1. 特征编码层（静态 Embedding + 多尺度时序编码）
-    2. 非线性全局聚合 + 局部冲击注意力 + 门控残差融合
-    3. AG-ResUnit 堆叠层（可扩展至 8 层双向 LSTM）
-    4. 预测输出层（Dynamic Focal Loss 在 Trainer 中启用）
+    完整架构（4 层流水线）:
+    1. 特征编码层：静态 Embedding（Linear+ReLU+LayerNorm）+
+       多尺度时序编码（MultiScaleTemporalEncoder）
+    2. AdaptiveFusion：全局统计聚合 + 局部冲击注意力 + 门控残差融合
+    3. 序列编码层：AG-ResUnit 堆叠（可扩展至 8 层双向 LSTM）
+    4. 分类器：静态跳连 + 多尺度跳连 + 时序池化 → MLP → logits
 
-    fusion_type='global_local' 为推荐实现；'legacy_cross' 保留旧版
-    TS-CrossAttention，便于兼容历史实验和进行同条件对比。
+    关键设计决策：
+    - 静态和多尺度表示通过跳连直达分类头，避免仅经门控时序分支间接传播
+      造成小样本下的信息瓶颈
+    - 支持可选的时序类别 Embedding（Taiwan PAY 状态）和位置 Embedding
+    - DynamicFocalLoss 在 Trainer 中启用，不由模型自身管理
+
+    Args:
+        static_dim: 静态特征维度
+        temporal_dim: 时序特征通道数
+        temporal_steps: 时序步数
+        hidden_dim: 隐藏维度
+        num_layers: AG-ResUnit 堆叠深度
+        num_classes: 输出类别数（固定为 2）
+        dropout: Dropout 比率
+        use_fusion: 是否启用 AdaptiveFusion
+        use_ag_resunit: 是否使用 AG-ResUnit（否则为标准 LSTM）
+        bidirectional: 是否双向
+        use_multiscale: 是否启用多尺度时序编码
+        local_window: 局部注意力窗口大小
+        use_global_context: 是否启用全局上下文分支
+        use_local_attention: 是否启用局部冲击注意力分支
+        temporal_categorical_index: 时序特征中类别变量的索引（Taiwan 为 0）
+        temporal_category_min: 类别 Embedding 的最小类别值
+        temporal_category_max: 类别 Embedding 的最大类别值
+        use_step_embedding: 是否添加可学习的时间步 Embedding
+        multiscale_mode: MultiScaleTemporalEncoder 模式（'legacy'/'lightweight'）
     """
 
     def __init__(self, static_dim, temporal_dim, temporal_steps, hidden_dim=128, num_layers=8, num_classes=2,
-                 dropout=0.3, num_heads=4, use_cross_attention=True, use_ag_resunit=True,
-                 bidirectional=True, use_multiscale=True, fusion_type='global_local',
+                 dropout=0.3, use_fusion=True, use_ag_resunit=True,
+                 bidirectional=True, use_multiscale=True,
                  local_window=3, use_global_context=True, use_local_attention=True,
                  temporal_categorical_index=None, temporal_category_min=-2,
                  temporal_category_max=8, use_step_embedding=False,
                  multiscale_mode='legacy'):
         super().__init__()
-        if fusion_type not in {'global_local', 'legacy_cross'}:
+        if use_fusion and not (use_global_context or use_local_attention):
             raise ValueError(
-                "fusion_type must be 'global_local' or 'legacy_cross'."
-            )
-        if (
-            use_cross_attention
-            and fusion_type == 'legacy_cross'
-            and hidden_dim % num_heads != 0
-        ):
-            raise ValueError(
-                "hidden_dim must be divisible by num_heads for legacy attention."
-            )
-        if use_cross_attention and not (
-            use_global_context or use_local_attention
-        ) and fusion_type == 'global_local':
-            raise ValueError(
-                "Global-local fusion needs at least one enabled branch."
+                "AdaptiveFusion requires at least one branch enabled."
             )
 
         self.hidden_dim = hidden_dim
         self.temporal_steps = temporal_steps
-        self.use_cross_attention = use_cross_attention
-        self.fusion_type = fusion_type if use_cross_attention else 'none'
+        self.use_fusion = use_fusion
         self.use_ag_resunit = use_ag_resunit
         self.bidirectional = bidirectional
         self.use_multiscale = use_multiscale
@@ -1674,12 +2007,10 @@ class AABiLSTM(nn.Module):
             'num_layers': int(num_layers),
             'num_classes': int(num_classes),
             'dropout': float(dropout),
-            'num_heads': int(num_heads),
-            'use_cross_attention': bool(use_cross_attention),
+            'use_fusion': bool(use_fusion),
             'use_ag_resunit': bool(use_ag_resunit),
             'bidirectional': bool(bidirectional),
             'use_multiscale': bool(use_multiscale),
-            'fusion_type': str(fusion_type),
             'local_window': int(local_window),
             'use_global_context': bool(use_global_context),
             'use_local_attention': bool(use_local_attention),
@@ -1747,40 +2078,23 @@ class AABiLSTM(nn.Module):
             multi_scale_dim = 0
         self.multi_scale_dim = multi_scale_dim
 
-        if use_cross_attention:
-            if fusion_type == 'global_local':
-                self.feature_fusion = NonlinearGlobalLocalFusion(
-                    hidden_dim=hidden_dim,
-                    window_size=min(local_window, max(temporal_steps, 1)),
-                    dropout=dropout,
-                    use_global_context=use_global_context,
-                    use_local_attention=use_local_attention
-                )
-                self.cross_attention = None
-            else:
-                self.feature_fusion = None
-                self.cross_attention = TSCrossAttention(
-                    static_dim=hidden_dim,
-                    temporal_dim=hidden_dim,
-                    hidden_dim=hidden_dim,
-                    num_heads=num_heads,
-                    dropout=dropout
-                )
+        if use_fusion:
+            self.feature_fusion = AdaptiveFusion(
+                hidden_dim=hidden_dim,
+                window_size=min(local_window, max(temporal_steps, 1)),
+                dropout=dropout,
+                use_global_context=use_global_context,
+                use_local_attention=use_local_attention
+            )
         else:
             self.feature_fusion = None
-            self.cross_attention = None
-
         self.multiscale_context_proj = (
             (
                 nn.Identity()
                 if multi_scale_dim == hidden_dim
                 else nn.Linear(multi_scale_dim, hidden_dim)
             )
-            if use_multiscale and use_cross_attention else None
-        )
-        self.cross_context_norm = (
-            nn.LayerNorm(hidden_dim)
-            if self.fusion_type == 'legacy_cross' else None
+            if use_multiscale and use_fusion else None
         )
 
         if use_ag_resunit:
@@ -1805,8 +2119,9 @@ class AABiLSTM(nn.Module):
             sequence_dim = hidden_dim * (2 if bidirectional else 1)
         self.sequence_dim = sequence_dim
 
-        # 静态和多尺度表示保留直达分类头的跳连，避免它们只能经门控时序
-        # 分支间接传播，在小样本 German 数据上尤其容易造成信息瓶颈。
+        # 分类头输入 = 时序池化 + 静态嵌入（跳连）+ 多尺度（跳连，可选）
+        # 跳连设计确保静态/多尺度信息不依赖门控时序分支间接传播；
+        # 在小样本数据集（如 German，仅 1000 样本）上这对避免信息瓶颈至关重要。
         classifier_input_dim = sequence_dim + hidden_dim
         if use_multiscale:
             classifier_input_dim += multi_scale_dim
@@ -1821,13 +2136,31 @@ class AABiLSTM(nn.Module):
         )
 
     def _encode_sequence(self, projected_temporal):
+        """将融合后的时序特征通过 AG-ResUnit 或标准 LSTM 编码。
+
+        Args:
+            projected_temporal: (B, T, hidden_dim) 融合后时序特征
+
+        Returns:
+            (B, T, sequence_dim) 编码后的序列
+        """
         if self.use_ag_resunit:
             return self.sequence_encoder(projected_temporal)
         sequence_out, _ = self.sequence_encoder(projected_temporal)
         return sequence_out
 
     def _pool_sequence(self, sequence_out):
-        """对 BiLSTM 进行池化，同时保留完整的后向历史信息"""
+        """序列池化：双向取前向末步 + 后向首步，单向取末步。
+
+        双向模式下，前向末步包含完整的"过去→未来"信息，
+        后向首步包含完整的"未来→过去"信息，拼接二者保留全局时序上下文。
+
+        Args:
+            sequence_out: (B, T, sequence_dim) 编码后的序列
+
+        Returns:
+            (B, sequence_dim) 池化后的时序表示
+        """
         if self.bidirectional:
             forward_final = sequence_out[:, -1, :self.hidden_dim]
             backward_final = sequence_out[:, 0, self.hidden_dim:]
@@ -1836,11 +2169,24 @@ class AABiLSTM(nn.Module):
 
     def forward(self, static_feat, temporal_feat, return_attention=False):
         """
+        前向传播：完整 4 层流水线。
+
+        流程：static_embedding → temporal_projection → multiscale_encoding →
+              adaptive_fusion → sequence_encoding → pooling →
+              classifier（跳连 static + multiscale）
+
         Args:
-            static_feat: [batch, static_dim]
-            temporal_feat: [batch, time_steps, temporal_dim]
+            static_feat: (B, static_dim) 静态特征
+            temporal_feat: (B, T, temporal_dim) 时序特征
+            return_attention: 是否返回 AdaptiveFusion 的诊断信息
+
+        Returns:
+            若 return_attention=False: (B, num_classes) logits
+            若 return_attention=True: (logits, fusion_diagnostics)
         """
         static_emb = self.static_embedding(static_feat)
+        # 类别通道乘以 0（mask），仅数值通道参与线性投影；
+        # 类别通道单独通过 Embedding 层处理，避免被当做连续值。
         temporal_numeric = temporal_feat * self.temporal_numeric_mask.view(
             1,
             1,
@@ -1848,30 +2194,35 @@ class AABiLSTM(nn.Module):
         )
         projected_temporal = self.temporal_projection(temporal_numeric)
         if self.temporal_category_embedding is not None:
+            # 提取类别通道值（如 Taiwan 的 PAY 状态，-2~8 的整数）
             category_value = temporal_feat[
                 :,
                 :,
                 self.temporal_categorical_index,
             ]
+            # round 处理 float32 精度导致的微小偏移（如 1.999 → 2）
             category_index = torch.round(category_value).long()
+            # 越界类别值（如缺失值）映射到 unknown 索引
             valid_category = (
                 (category_index >= self.temporal_category_min)
                 & (category_index <= self.temporal_category_max)
             )
-            category_index = category_index - self.temporal_category_min
+            category_index = category_index - self.temporal_category_min  # 偏移到 0 起始
             category_index = torch.where(
                 valid_category,
                 category_index,
                 torch.full_like(
                     category_index,
-                    self.temporal_category_unknown,
+                    self.temporal_category_unknown,  # 超出 [-2, 8] 的值统一映射到此
                 ),
             )
+            # 类别 Embedding 与数值投影相加（残差式注入语义信息）
             projected_temporal = (
                 projected_temporal
                 + self.temporal_category_embedding(category_index)
             )
         if self.step_embedding is not None:
+            # 可学习的位置编码：告知模型当前是第几个时间步
             step_index = torch.arange(
                 temporal_feat.shape[1],
                 device=temporal_feat.device,
@@ -1890,34 +2241,16 @@ class AABiLSTM(nn.Module):
 
         sequence_input = projected_temporal
         fusion_diagnostics = None
-
-        if self.use_cross_attention:
+        if self.use_fusion:
             multi_scale_context = (
                 self.multiscale_context_proj(multi_scale_repr)
                 if multi_scale_repr is not None else None
             )
-            if self.fusion_type == 'global_local':
-                sequence_input, fusion_diagnostics = self.feature_fusion(
-                    static_emb,
-                    projected_temporal,
-                    multi_scale_context
-                )
-            else:
-                attention_context = projected_temporal
-                if multi_scale_context is not None:
-                    attention_context = torch.cat([
-                        projected_temporal,
-                        multi_scale_context.unsqueeze(1)
-                    ], dim=1)
-                cross_fused, attention_weights = self.cross_attention(
-                    static_emb, attention_context
-                )
-                sequence_input = self.cross_context_norm(
-                    projected_temporal + cross_fused.unsqueeze(1)
-                )
-                fusion_diagnostics = {
-                    'legacy_attention': attention_weights
-                }
+            sequence_input, fusion_diagnostics = self.feature_fusion(
+                static_emb,
+                projected_temporal,
+                multi_scale_context
+            )
 
         sequence_out = self._encode_sequence(sequence_input)
         temporal_repr = self._pool_sequence(sequence_out)
@@ -1939,12 +2272,24 @@ class AABiLSTM(nn.Module):
 
 class DynamicFocalLoss(nn.Module):
     """
-    动态焦点损失函数 (Dynamic Focal Loss)
+    动态焦点损失函数（Dynamic Focal Loss）。
 
-    描述:
-    - 根据训练 epoch 调整 γ，早期接近加权交叉熵
-    - 后期增大 γ；样本难度由标准 focal 因子 (1-p_t)^γ 自适应处理
-    - 对违约类(y=1)增强关注
+    核心机制：
+    - gamma 按 epoch 调度从 gamma_base 增长到 gamma_max，
+      早期接近加权交叉熵（容易收敛），后期增大难样本权重（聚焦难例）
+    - alpha 类别权重在初始化时从训练集全局频率计算，避免 mini-batch 随机抖动
+    - 调度函数：gamma = gamma_base + (gamma_max - gamma_base) * (epoch/num_epoch)^schedule_power
+
+    公式：
+        FL = -α_t * (1 - p_t)^γ * log(p_t)
+
+    Args:
+        alpha_pos: 正类（违约）的全局权重
+        alpha_neg: 负类（正常）的全局权重
+        gamma_base: gamma 起始值
+        gamma_max: gamma 终止值
+        num_epoch: 总 epoch 数（用于 gamma 调度）
+        schedule_power: 调度曲线的幂指数（<1 时 gamma 前期增长快，>1 时后期增长快）
     """
 
     def __init__(
@@ -1980,41 +2325,52 @@ class DynamicFocalLoss(nn.Module):
 
     def forward(self, inputs, targets):
         """
+        计算当前 epoch 的动态 focal loss。
+
+        使用 log_softmax（而非 softmax + log）避免数值下溢，
+        并 clamp p_t > eps 防止 focal_weight 的 pow 操作出现无效梯度。
+
         Args:
-            inputs: [N, C] 模型输出(logits)
-            targets: [N] 真实标签
+            inputs: (N, 2) 模型输出 logits
+            targets: (N,) 真实标签（0 或 1）
+
+        Returns:
+            scalar: 该批次的平均 loss
         """
         if inputs.ndim != 2 or inputs.shape[1] != 2:
             raise ValueError("DynamicFocalLoss expects binary logits with shape [N, 2].")
         if targets.ndim != 1 or targets.shape[0] != inputs.shape[0]:
             raise ValueError("targets must have shape [N].")
 
-        # 在 float32 中使用 log_softmax，避免 softmax 下溢以及 log(p + eps)
-        # 截断极难样本的梯度。
+        # 使用 log_softmax（而非 softmax+log）避免 softmax 下溢；
+        # log_p_t 直接从 log_softmax gather 得到，数值更稳定。
         log_probs = F.log_softmax(inputs.float(), dim=-1)
         log_p_t = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
-        p_t = log_p_t.exp()
+        p_t = log_p_t.exp()  # 正确类别概率，用于计算 focal 因子
 
+        # gamma 调度：power < 1 时前期增长快（早期即关注难样本），
+        #          power > 1 时后期增长快（先易后难）。
         progress = min(
             ((self.current_epoch + 1) / self.num_epoch) ** self.schedule_power,
             1.0,
         )
-        # gamma 只按 epoch 调度；(1-p_t)^gamma 本身已经根据预测难度
-        # 调权，无需再令 gamma 依赖 p_t。
         gamma = self.gamma_base + (
             self.gamma_max - self.gamma_base
         ) * progress
 
-        # 类别权重在整个训练集上一次性确定，避免随随机 mini-batch 抖动。
+        # alpha 由训练集全局频率确定（初始化为固定值），不随 mini-batch 变化
         alpha_t = torch.where(
             targets == 1,
             log_p_t.new_tensor(self.alpha_pos),
             log_p_t.new_tensor(self.alpha_neg),
         )
+        # focal_weight = (1-p_t)^γ：p_t 越大（越容易），权重越小
+        # clamp_min(eps) 防止 p_t=1 时 pow 操作的梯度退化
         focal_base = (1.0 - p_t).clamp_min(
             torch.finfo(p_t.dtype).eps
         )
         focal_weight = focal_base.pow(gamma)
+        # FL = -α_t * (1-p_t)^γ * log(p_t)
         loss = -alpha_t * focal_weight * log_p_t
 
         return loss.mean()
@@ -2025,7 +2381,12 @@ class DynamicFocalLoss(nn.Module):
 # ==============================
 
 class EarlyStopping:
-    """早停机制"""
+    """早停机制：验证指标连续 patience 轮不提升（提升 < min_delta）则停止训练。
+
+    Args:
+        patience: 容忍轮数
+        min_delta: 最小提升阈值
+    """
 
     def __init__(self, patience=10, min_delta=0.0001):
         self.patience = patience
@@ -2052,7 +2413,22 @@ class EarlyStopping:
 
 
 class Trainer:
-    """模型训练器"""
+    """
+    AA-BiLSTM 模型训练器。
+
+    集成了完整的训练流程：
+    - 混合精度训练（AMP）+ 梯度裁剪
+    - AdamW 优化器 + 余弦退火学习率调度
+    - EMA（指数移动平均）权重平滑
+    - Platt 概率校准（交叉拟合，含 OOF 评估）
+    - 基于 Wilson 下界的阈值搜索（保证敏感性下限的同时最大化 Accuracy）
+    - 早停机制
+    - 多目标 checkpoint 选择（AUC / AUC-PR / hybrid / accuracy）
+
+    关键设计：
+    - 阈值搜索使用原始 margin 排序（不受校准影响），校准映射保持单调性
+    - EMA 权重在训练结束后与最佳 checkpoint 竞争，取验证分数更高者
+    """
 
     def __init__(self, model, train_loader, val_loader, test_loader,
                  calibration_loader=None,
@@ -2138,8 +2514,10 @@ class Trainer:
         # 损失函数
         if use_dynamic_focal:
             counts = self._compute_class_counts(train_loader)
-            # 0.5 次幂比完全逆频率更温和：通常可减少假阳性、改善 Accuracy，
-            # 再由验证集阈值保证敏感性下限。
+            # class_balance_power=0.5：次幂根比完全逆频率温和。
+            #   完全逆频率（power=1.0）→ 极端少数类 alpha≈0.9+
+            #   平方根（power=0.5）→ 少数类 alpha≈0.7~0.8
+            # 温和的 alpha 减少假阳性（False Positive），再由验证集阈值保障敏感性。
             raw_weights = np.power(
                 1.0 / np.maximum(counts, 1.0),
                 self.class_balance_power,
@@ -2216,13 +2594,23 @@ class Trainer:
 
     @classmethod
     def _compute_class_weights(cls, loader):
-        """计算全局 inverse-frequency 类别权重。"""
+        """计算全局 inverse-frequency 类别权重。
+
+        公式：w_i = (1/count_i) / sum(1/counts) * 2
+        *2 使得二分类任务中权重均值为 1（即 loss 量级与不加权一致），
+        避免权重整体偏大导致学习率需要重新调节。
+        """
         counts = cls._compute_class_counts(loader)
         weights = 1.0 / counts
-        weights = weights / weights.sum() * 2  # 归一化
+        weights = weights / weights.sum() * 2
         return torch.FloatTensor(weights)
 
     def _update_ema(self):
+        """更新模型权重的指数移动平均（EMA）。
+
+        公式：shadow = decay * shadow + (1 - decay) * current_weight
+        仅对浮点参数做平滑，整数型参数（如 batch norm 计数）直接复制。
+        """
         if self.ema_state is None:
             return
         with torch.no_grad():
@@ -2237,6 +2625,11 @@ class Trainer:
                     shadow.copy_(value)
 
     def _selection_score(self, metrics):
+        """根据 selection_metric 计算验证集选择分数。
+
+        'hybrid' 模式：0.55*AUC-PR + 0.20*BalancedAcc + 0.15*Acc + 0.10*Sensitivity
+        以排序能力为主，同时轻度偏向 Accuracy 与敏感性更均衡的 epoch。
+        """
         if self.selection_metric == 'hybrid':
             pass  # fallthrough below
         elif self.selection_metric == 'accuracy':
@@ -2260,6 +2653,14 @@ class Trainer:
         )
 
     def _collect_logits(self, loader):
+        """遍历 DataLoader 收集所有样本的 logits 和标签。
+
+        Args:
+            loader: 数据加载器
+
+        Returns:
+            (logits, labels): logits 形状 (N, 2)，labels 形状 (N,)
+        """
         self.model.eval()
         logits_batches = []
         label_batches = []
@@ -2282,40 +2683,21 @@ class Trainer:
             torch.cat(label_batches, dim=0),
         )
 
-    def fit_temperature(self):
-        """在验证集上以 NLL 拟合单一温度，不改变概率排序。"""
-        logits, labels = self._collect_logits(self.val_loader)
-        candidates = np.exp(np.linspace(np.log(0.25), np.log(4.0), 81))
-
-        def nll_at(temperature):
-            return float(F.cross_entropy(
-                logits / float(temperature),
-                labels,
-            ).item())
-
-        losses = np.asarray([nll_at(value) for value in candidates])
-        best_idx = int(np.argmin(losses))
-        best_temperature = float(candidates[best_idx])
-
-        lower = candidates[max(best_idx - 1, 0)]
-        upper = candidates[min(best_idx + 1, len(candidates) - 1)]
-        refined = np.linspace(lower, upper, 41)
-        refined_losses = np.asarray([nll_at(value) for value in refined])
-        refined_idx = int(np.argmin(refined_losses))
-        best_temperature = float(refined[refined_idx])
-        return best_temperature, {
-            'nll_before': nll_at(1.0),
-            'nll_after': float(refined_losses[refined_idx]),
-        }
-
     @staticmethod
     def _fit_platt_parameters(margins, labels):
+        """用 LogisticRegression 在 margin 上做 Platt 校准参数估计。
+
+        Platt 公式: P(y=1|x) = 1 / (1 + exp(-(scale * margin + bias)))
+        其中 scale = coef_[0,0], bias = intercept_[0]。
+        C=10.0 提供适度的 L2 正则，防止 scale 在小样本上发散。
+        scale <= 0 说明校准方向与标签相反 → 退回 identity（1.0, 0.0）。
+        """
         margins = np.asarray(margins, dtype=np.float64).reshape(-1, 1)
         labels = np.asarray(labels, dtype=np.int64)
         if len(np.unique(labels)) != 2:
             return 1.0, 0.0
         calibrator = LogisticRegression(
-            C=10.0,
+            C=10.0,            # 适度的 L2 正则化，防止小数据过拟合
             solver='lbfgs',
             max_iter=1000,
             random_state=42,
@@ -2324,11 +2706,16 @@ class Trainer:
         scale = float(calibrator.coef_[0, 0])
         bias = float(calibrator.intercept_[0])
         if not np.isfinite(scale) or not np.isfinite(bias) or scale <= 0.0:
-            return 1.0, 0.0
+            return 1.0, 0.0  # 校准失败 → 退回恒等变换
         return scale, bias
 
     @staticmethod
     def _apply_platt(margins, scale, bias):
+        """对 margin 应用 Platt 校准：calibrated_prob = sigmoid(scale * margin + bias)。
+
+        clip 到 [-40, 40]：sigmoid(-40) ≈ 4e-18, sigmoid(40) ≈ 1-4e-18，
+        足以覆盖 float64 有效精度范围，同时防止 overflow。
+        """
         calibrated_logit = np.clip(
             float(scale) * np.asarray(margins, dtype=np.float64)
             + float(bias),
@@ -2339,20 +2726,26 @@ class Trainer:
 
     def fit_platt_scaling(self):
         """
-        Fit affine log-odds calibration on the dedicated operating split.
+        在专用的校准集（calibration split）上拟合交叉验证 Platt 概率校准。
 
-        Out-of-fold probabilities estimate calibration generalization.
-        Operating-threshold search uses the uncalibrated margin ranking and
-        is mapped through the final monotonic calibrator afterwards; this
-        avoids fold-specific calibrators scrambling the global ranking.
+        流程：
+        1. 对校准集计算 margin = logit_pos - logit_neg
+        2. 做 StratifiedKFold 交叉拟合（最多 5-fold），得到 OOF（out-of-fold）概率
+        3. 再用全量校准集拟合最终的 scale/bias
+        4. 比较 NLL（校准前 vs 校准后 vs OOF），若校准后 NLL 反而恶化则退回 identity
+
+        重要：阈值搜索在原始 margin 排序空间进行，然后再通过校准参数映射到
+        校准后概率空间，这样确保校准不会扰乱排序质量。
         """
         logits, label_tensor = self._collect_logits(
             self.calibration_loader
         )
         labels = label_tensor.numpy().astype(np.int64)
+        # margin = 正类 logit - 负类 logit，作为 Platt 校准的输入
         margins = (logits[:, 1] - logits[:, 0]).numpy()
-        raw_probabilities = self._apply_platt(margins, 1.0, 0.0)
+        raw_probabilities = self._apply_platt(margins, 1.0, 0.0)  # 校准前原始概率
         class_counts = np.bincount(labels, minlength=2)
+        # fold 数不超过少数类样本数
         n_splits = int(min(5, class_counts.min()))
 
         if n_splits >= 2:
@@ -2396,6 +2789,10 @@ class Trainer:
             np.clip(oof_probabilities, 1e-7, 1.0 - 1e-7),
             labels=[0, 1],
         )
+        # 防退化保护：
+        # - 全量校准 NLL 恶化 → 退回 identity（scale=1, bias=0）
+        # - OOF NLL 恶化超过 0.02 → OOF 退回到原始概率
+        # （OOF 容差更大，因为交叉验证本身有额外方差）
         if nll_after > nll_before + 1e-8:
             scale, bias = 1.0, 0.0
             nll_after = nll_before
@@ -2415,9 +2812,24 @@ class Trainer:
 
     @staticmethod
     def _expected_calibration_error(labels, probabilities, n_bins=15):
-        labels = np.asarray(labels)
+        """计算 Expected Calibration Error（ECE，期望校准误差）。
+
+        将 [0,1] 等分为 n_bins 个 bin，每个 bin 内取预测概率均值与真实标签均值的
+        绝对差，按 bin 样本比例加权求和。ECE 越低，概率校准越好。
+
+        Args:
+            labels: (N,) 真实标签
+            probabilities: (N,) 预测概率
+            n_bins: 分箱数
+
+        Returns:
+            float: ECE 值
+        """
         probabilities = np.asarray(probabilities)
         edges = np.linspace(0.0, 1.0, n_bins + 1)
+        # np.digitize 用 edges[1:-1] 作为分界点（去掉 0 和 1 两个端点），
+        # right=False 使概率值等于边界时归入右侧 bin；
+        # np.minimum(..., n_bins-1) 将概率=1.0 的样本归入最后一个 bin
         bin_ids = np.minimum(
             np.digitize(probabilities, edges[1:-1], right=False),
             n_bins - 1,
@@ -2437,7 +2849,14 @@ class Trainer:
         return float(result)
 
     def train_epoch(self, epoch):
-        """训练一个 epoch（混合精度 + 梯度裁剪）"""
+        """训练一个 epoch：混合精度前向 → 反向 → 梯度裁剪 → 优化器步进 → EMA 更新。
+
+        Args:
+            epoch: 当前 epoch 编号（用于 DynamicFocalLoss 的 gamma 调度）
+
+        Returns:
+            float: 该 epoch 的平均训练 loss
+        """
         self.model.train()
         if isinstance(self.criterion, DynamicFocalLoss):
             self.criterion.set_epoch(epoch)
@@ -2450,9 +2869,13 @@ class Trainer:
             temporal = batch['temporal'].to(device, non_blocking=True)
             labels = batch['label'].to(device, non_blocking=True)
 
+            # set_to_none=True：将梯度设为 None 而非 zeros()，
+            # 减少显存占用，且避免 AdamW 对零梯度累加不必要的动量更新。
             self.optimizer.zero_grad(set_to_none=True)
 
-            # 混合精度前向传播
+            # 混合精度前向传播（AMP）：
+            # CUDA 上自动将大部分运算转为 float16，节省显存并加速；
+            # 损失计算保持在 float32 避免下溢。
             with torch.autocast(
                 device_type=device.type,
                 enabled=self.amp_enabled,
@@ -2465,15 +2888,17 @@ class Trainer:
                     "and the model's numerical operations."
                 )
 
-            # 混合精度反向传播
+            # 混合精度反向传播：scaler 将 loss 放大防止 float16 梯度下溢
             self.scaler.scale(loss).backward()
 
-            # 梯度裁剪（防止梯度爆炸）
+            # 梯度裁剪前必须 unscale，否则裁剪的是放大的梯度
             self.scaler.unscale_(self.optimizer)
+            # max_norm=1.0：将梯度 L2 范数限制在 1.0 以内，
+            # 选择 1.0 而非更小的值是因为 AMP 已提供一定数值稳定性。
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(),
                 max_norm=1.0,
-                error_if_nonfinite=False,
+                error_if_nonfinite=False,  # 非有限梯度不抛异常，由后续检查处理
             )
             if not torch.isfinite(grad_norm):
                 raise FloatingPointError(
@@ -2485,6 +2910,8 @@ class Trainer:
             self._update_ema()
 
             batch_samples = labels.shape[0]
+            # 加权平均：每个 batch 的 loss 按其样本数加权，
+            # 确保最后一个不完整 batch 不会过度影响总 loss
             total_loss += loss.item() * batch_samples
             total_samples += batch_samples
 
@@ -2501,7 +2928,22 @@ class Trainer:
         calibration_scale=None,
         calibration_bias=None,
     ):
-        """评估模型，并返回排序、分类和概率校准指标。"""
+        """评估模型，返回排序、分类和概率校准指标的完整集合。
+
+        计算指标包括：Accuracy, AUC-ROC, AUC-PR, F1, F2, Precision,
+        Sensitivity(Recall), Specificity, Balanced Accuracy, MCC, KS,
+        Lift@10%, LogLoss, Brier Score, ECE。
+
+        Args:
+            loader: 评估数据加载器
+            threshold: 决策阈值（默认 self.decision_threshold）
+            temperature: 温度缩放参数（与 calibration_scale 互斥）
+            calibration_scale: Platt 校准的 scale 参数
+            calibration_bias: Platt 校准的 bias 参数
+
+        Returns:
+            dict: 含所有指标及原始 predictions/probabilities/labels 的字典
+        """
         self.model.eval()
         if threshold is None:
             threshold = self.decision_threshold
@@ -2530,6 +2972,8 @@ class Trainer:
                     raise FloatingPointError(
                         "Non-finite model outputs detected during evaluation."
                     )
+                # margin = logit_pos - logit_neg：正类相对于负类的 log-odds。
+                # 通过 Platt 校准后再做 sigmoid 得到校准后违约概率。
                 margin = outputs[:, 1].float() - outputs[:, 0].float()
                 positive_probability = torch.sigmoid(
                     calibration_scale * margin + calibration_bias
@@ -2551,6 +2995,7 @@ class Trainer:
         try:
             auc = roc_auc_score(flat_labels, flat_probs)
             fpr, tpr, _ = roc_curve(flat_labels, flat_probs)
+            # KS = max(TPR - FPR)：衡量模型区分为正负两类的能力
             ks = float(np.max(tpr - fpr))
         except ValueError:
             auc = np.nan
@@ -2592,9 +3037,11 @@ class Trainer:
             flat_labels,
             clipped_probs,
         )
+        # Lift@10%：预测概率最高的前 10% 样本中违约率 / 整体违约率
+        # 值 > 1 表示模型能有效将高风险样本排到前列
         top_count = max(1, int(np.ceil(len(flat_labels) * 0.10)))
         top_indices = np.argsort(flat_probs)[-top_count:]
-        base_rate = max(float(np.mean(flat_labels)), 1e-12)
+        base_rate = max(float(np.mean(flat_labels)), 1e-12)  # 防除零
         lift_at_10 = float(np.mean(flat_labels[top_indices]) / base_rate)
 
         return {
@@ -2626,10 +3073,18 @@ class Trainer:
 
     @staticmethod
     def _wilson_lower_bound(successes, total, confidence=0.80):
+        """Wilson 分数区间下界：对二项比例 p 的单侧置信下界。
+
+        公式（Wilson score interval lower bound）：
+          lower = (p + z²/(2n) - z*sqrt(p(1-p)/n + z²/(4n²))) / (1 + z²/n)
+
+        相比 Wald 区间（p ± z*sqrt(p(1-p)/n)），Wilson 区间在
+        p 接近 0 或 1 时不会越界，小样本下更保守可靠。
+        """
         if total <= 0:
             return 0.0
         proportion = successes / total
-        z_value = NormalDist().inv_cdf(confidence)
+        z_value = NormalDist().inv_cdf(confidence)  # 单侧 z 值
         denominator = 1.0 + z_value ** 2 / total
         centre = proportion + z_value ** 2 / (2.0 * total)
         radius = z_value * np.sqrt(
@@ -2644,7 +3099,26 @@ class Trainer:
         labels=None,
         probabilities=None,
     ):
-        """仅在验证集上选择概率阈值"""
+        """在验证/校准集上搜索满足敏感性下限的最优决策阈值。
+
+        搜索策略：
+        1. 遍历所有候选阈值（预测概率的相邻中点）
+        2. 使用 Wilson 置信下界评估敏感性下限是否满足要求
+           （小样本（正类 < 50）回退到点估计）
+        3. 在满足约束的候选中，按 threshold_objective 选择最优：
+           - 'hybrid': 0.75*Accuracy + 0.10*BalancedAcc + 0.10*F1
+           - 'f1': 直接取最高 F1
+           - 'balanced_accuracy': 直接取最高 Balanced Accuracy
+           - 'accuracy': 直接取最高 Accuracy
+
+        Args:
+            min_sensitivity: 敏感性（召回率）下限
+            labels: 真实标签，None 时从 calibration_loader 读取
+            probabilities: 预测概率，None 时从 calibration_loader 读取
+
+        Returns:
+            (threshold, metrics_dict): 最优阈值和对应的指标字典
+        """
         if labels is None or probabilities is None:
             operating = self.evaluate(
                 self.calibration_loader,
@@ -2657,6 +3131,8 @@ class Trainer:
         scored = []
         point_constrained = []
 
+        # 候选阈值生成：取相邻唯一概率值的中间点，避免在概率分布的
+        # 稀疏区域产生大量无效候选。候选数 > 5000 时用量化降采样。
         unique_probabilities = np.unique(probabilities)
         if len(unique_probabilities) > 5000:
             unique_probabilities = np.quantile(
@@ -2664,11 +3140,12 @@ class Trainer:
                 np.linspace(0.0, 1.0, 5000),
             )
         if len(unique_probabilities) == 1:
-            candidates = np.asarray([0.5], dtype=float)
+            candidates = np.asarray([0.5], dtype=float)  # 所有样本概率相同，只能用默认值
         else:
             candidates = (
                 unique_probabilities[:-1] + unique_probabilities[1:]
             ) / 2.0
+            # 边界扩展：确保候选覆盖 [0, 1] 区间两端
             candidates = np.concatenate([
                 [max(0.0, unique_probabilities[0] - 1e-7)],
                 candidates,
@@ -2847,12 +3324,14 @@ class Trainer:
             )
 
         best_source = 'checkpoint'
+        # EMA 权重与最佳 checkpoint 竞争：加载 EMA 权重重新评估，
+        # 若 EMA 的验证分数更高，则用 EMA 权重替代 checkpoint。
         if self.ema_state is not None:
             self.model.load_state_dict(self.ema_state)
             ema_metrics = self.evaluate(
                 self.val_loader,
                 threshold=0.5,
-                temperature=1.0,
+                temperature=1.0,  # 用原始概率（无温度缩放）评估
             )
             ema_score = self._selection_score(ema_metrics)
             if np.isfinite(ema_score) and ema_score > best_score:
@@ -2892,6 +3371,9 @@ class Trainer:
             self.calibration_bias = 0.0
         self.temperature = 1.0 / max(self.calibration_scale, 1e-7)
 
+        # 阈值搜索在原始 margin 概率空间进行（排序不变），
+        # 然后将原始阈值通过 Platt 映射到校准后概率空间。
+        # 路径：raw_threshold → logit（log-odds 变换）→ calibrated_prob（Platt sigmoid）
         raw_decision_threshold, validation_threshold_metrics = self.find_best_threshold(
             min_sensitivity=self.threshold_min_sensitivity,
             labels=operating_labels,
@@ -2902,14 +3384,18 @@ class Trainer:
             1e-7,
             1.0 - 1e-7,
         ))
+        # 将概率阈值转为 logit 空间：log(p/(1-p))
         raw_threshold_logit = np.log(
             clipped_raw_threshold / (1.0 - clipped_raw_threshold)
         )
+        # 用 Platt 参数映射 logit → 校准后概率
         self.decision_threshold = float(self._apply_platt(
             np.asarray([raw_threshold_logit]),
             self.calibration_scale,
             self.calibration_bias,
         )[0])
+        # 将操作集概率转为 margin（logit 空间），再做 Platt 校准，
+        # 得到校准后的概率分布，最后计算预测熵。
         operating_margin = np.log(
             np.clip(operating_probabilities, 1e-7, 1.0 - 1e-7)
             / np.clip(
@@ -2923,6 +3409,8 @@ class Trainer:
             self.calibration_scale,
             self.calibration_bias,
         )
+        # 熵阈值 = 验证集预测熵的 95 分位数
+        # 熵高 → 模型不确定 → 可在部署时触发人工复核或保守处理
         val_probability = np.clip(
             calibrated_operating_probabilities,
             1e-12,
@@ -2997,14 +3485,25 @@ class Trainer:
 
 
 def specificity_score(y_true, y_pred):
-    """计算特异性"""
+    """计算 Specificity（真负率）= TN / (TN + FP)。
+
+    sklearn 未直接提供此指标，从 confusion matrix 手动计算。
+    """
     tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
     denominator = tn + fp
     return float(tn / denominator) if denominator else 0.0
 
 
 class SequenceBaselineModel(nn.Module):
-    """LSTM/Bi-LSTM/Attention-LSTM/ResNet-LSTM 基线模型"""
+    """序列基线模型：统一接口支持 LSTM / Bi-LSTM / Attention-LSTM / ResNet-LSTM。
+
+    Args:
+        static_dim: 静态特征维度
+        temporal_dim: 时序特征维度
+        hidden_dim: 隐藏维度
+        model_type: 'lstm' / 'bilstm' / 'attention_lstm' / 'resnet_lstm'
+        dropout: Dropout 比率
+    """
 
     def __init__(self, static_dim, temporal_dim, hidden_dim=64, model_type='lstm', dropout=0.3):
         super().__init__()
@@ -3050,7 +3549,22 @@ class SequenceBaselineModel(nn.Module):
 def train_sequence_baseline(name, model, X_static_train, X_temporal_train, y_train,
                             X_static_test, X_temporal_test, y_test,
                             epochs=20, batch_size=128, lr=1e-3):
-    """训练一个轻量级神经网络基线模型，并返回评估指标"""
+    """训练一个轻量级神经网络基线模型并返回测试集评估指标。
+
+    使用标准 CrossEntropyLoss + AdamW，固定阈值 0.5。
+
+    Args:
+        name: 模型名称（用于日志）
+        model: nn.Module 实例
+        X_static_train/X_temporal_train/y_train: 训练数据
+        X_static_test/X_temporal_test/y_test: 测试数据
+        epochs: 训练轮数
+        batch_size: 批次大小
+        lr: 学习率
+
+    Returns:
+        dict: 含 acc / auc / auc_pr / f1 / sensitivity / specificity
+    """
     train_dataset = CreditDataset(X_static_train, X_temporal_train, y_train)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                               pin_memory=torch.cuda.is_available())
@@ -3102,7 +3616,13 @@ def train_sequence_baseline(name, model, X_static_train, X_temporal_train, y_tra
 # ==============================
 
 class SHAPModelWrapper(nn.Module):
-    """包装模型以适配SHAP的输入格式"""
+    """包装双输入模型以适配 SHAP 的单列表输入或多位置参数输入。
+
+    SHAP explainer 期望模型接受单一参数（列表或元组），此包装器自动解包。
+
+    Args:
+        model: 接受 (static, temporal) 双参数的 nn.Module
+    """
     def __init__(self, model):
         super().__init__()
         self.model = model
@@ -3119,7 +3639,14 @@ class SHAPModelWrapper(nn.Module):
 
 
 class Explainer:
-    """SHAP 可解释性分析"""
+    """
+    SHAP 可解释性分析封装。
+
+    提供双输入模型（静态 + 时序）的 SHAP 解释：
+    - 优先使用 DeepExplainer（快，基于梯度）
+    - 失败时自动回退到 KernelExplainer（慢但鲁棒）
+    - 自动展平时序特征以兼容 KernelExplainer 的单输入格式
+    """
 
     def __init__(self, model, feature_names=None):
         try:
@@ -3133,7 +3660,20 @@ class Explainer:
         self.shap = shap
 
     def explain(self, static_data, temporal_data, sample_size=100):
-        """使用 SHAP 解释模型预测"""
+        """使用 SHAP 解释模型对双输入特征的预测。
+
+        优先尝试 DeepExplainer（梯度法，速度快），失败后自动回退到
+        KernelExplainer（扰动法，速度慢但兼容性更好）。
+
+        Args:
+            static_data: (N, S) 静态特征
+            temporal_data: (N, T, F) 时序特征
+            sample_size: 背景样本数（用于拟合 SHAP explainer）
+
+        Returns:
+            (shap_values, explainer): shap_values 为双输入模型的 SHAP 值列表，
+            explainer 为 SHAP explainer 对象
+        """
         self.model.eval()
         if sample_size < 1 or sample_size >= len(static_data):
             raise ValueError(
@@ -3184,20 +3724,25 @@ class Explainer:
             return self._kernel_explain(static_data, temporal_data, sample_size)
 
     def _kernel_explain(self, static_data, temporal_data, sample_size):
-        """使用 KernelExplainer 作为备用方案"""
+        """使用 KernelExplainer 作为备用方案（扰动法，比 DeepExplainer 慢但兼容性更好）。
+
+        KernelExplainer 需要展平的 (N, D) 单表输入，因此将时序特征 reshape 为
+        (N, T*F) 后与静态特征拼接；预测函数内部再恢复三维形状。
+        """
         wrapped_model = SHAPModelWrapper(self.model).to(device)
         wrapped_model.eval()
 
-        # 展平特征用于 KernelExplainer
+        # KernelExplainer 需要展平的 (N, D) 输入
         static_flat = static_data[:sample_size]
-        temporal_flat = temporal_data[:sample_size].reshape(sample_size, -1)
+        temporal_flat = temporal_data[:sample_size].reshape(sample_size, -1)  # (sample, T*F)
         background_flat = np.concatenate([static_flat, temporal_flat], axis=1)
 
         def model_predict(flat_input):
+            """KernelExplainer 的回调：展平输入 → 恢复三维 → 前向 → softmax 正类概率。"""
             n = flat_input.shape[0]
             static_dim = static_data.shape[1]
-            temporal_dim_2d = temporal_data.shape[1]
-            temporal_dim_3d = temporal_data.shape[2]
+            temporal_dim_2d = temporal_data.shape[1]   # T
+            temporal_dim_3d = temporal_data.shape[2]   # F
 
             static_part = torch.FloatTensor(flat_input[:, :static_dim]).to(device)
             temporal_part = torch.FloatTensor(
@@ -3236,6 +3781,17 @@ class Explainer:
 
 
 def build_feature_names(data_loader, static_dim, temporal_steps, temporal_dim):
+    """从 data_loader 构建静态和时序特征的完整名称列表。
+
+    Args:
+        data_loader: CreditDataLoader 实例
+        static_dim: 静态特征维度
+        temporal_steps: 时序步数
+        temporal_dim: 时序特征通道数
+
+    Returns:
+        (static_names, temporal_names): 两个名称列表
+    """
     static_names = data_loader.static_feature_names or [f'static_{i}' for i in range(static_dim)]
     if data_loader.temporal_flat_feature_names:
         temporal_names = list(data_loader.temporal_flat_feature_names)
@@ -3251,7 +3807,21 @@ def build_feature_names(data_loader, static_dim, temporal_steps, temporal_dim):
 
 
 def run_shap_summary(model, data_loader, X_static_test, X_temporal_test, dataset_name, sample_size=None):
-    """运行 SHAP 并在支持时输出简洁的全局解释摘要"""
+    """运行 SHAP 分析并输出 Top-10 特征重要性排名。
+
+    对双输入模型分别计算静态特征和展平时序特征的 |SHAP| 均值，
+    合并后取前 10 个最重要的特征输出。
+
+    Args:
+        model: 训练好的 AABiLSTM 模型
+        data_loader: CreditDataLoader（含特征名）
+        X_static_test/X_temporal_test: 评估数据
+        dataset_name: 数据集名（用于输出标题）
+        sample_size: SHAP 背景样本数（None 时自动根据数据量调整）
+
+    Returns:
+        shap_values 或 None（分析失败时）
+    """
     # 根据数据集大小动态调整样本数
     if sample_size is None:
         n_test = len(X_static_test)
@@ -3287,12 +3857,15 @@ def run_shap_summary(model, data_loader, X_static_test, X_temporal_test, dataset
         print("SHAP values computed, but returned layout is not a two-input explanation.")
         return shap_values
 
-    # 如果是二分类，取正类的SHAP值
+    # SHAP 对二分类模型返回 (n_samples, n_features, 2) 形状，
+    # 每个样本每个特征有两个 SHAP 值（分别对应两个类别的 logit 贡献），
+    # 取正类（index=1）的 SHAP 值。
     if static_values.ndim >= 3 and static_values.shape[-1] == 2:
         static_values = static_values[..., 1]
     if temporal_values.ndim >= 4 and temporal_values.shape[-1] == 2:
         temporal_values = temporal_values[..., 1]
 
+    # 展平时序 SHAP 值与静态 SHAP 值合并，按 |SHAP| 均值排序
     temporal_values = temporal_values.reshape(temporal_values.shape[0], -1)
     static_importance = np.abs(static_values).mean(axis=0).reshape(-1)
     temporal_importance = np.abs(temporal_values).mean(axis=0).reshape(-1)
@@ -3310,7 +3883,18 @@ def run_shap_summary(model, data_loader, X_static_test, X_temporal_test, dataset
 
 def summarize_fusion_diagnostics(model, data_loader, X_static_test,
                                  X_temporal_test, sample_size=256):
-    """汇总全局门、局部门、局部窗口权重与时间步突变强度。"""
+    """汇总 AdaptiveFusion 的诊断信息：全局门、局部门、局部窗口注意力权重、时间步突变强度。
+
+    Args:
+        model: 训练好的 AABiLSTM 模型
+        data_loader: 含时序步/特征名的 CreditDataLoader
+        X_static_test/X_temporal_test: 评估数据
+        sample_size: 采样子集大小
+
+    Returns:
+        dict: 含 local_attention_by_lag / local_gate_mean / global_gate_mean /
+              mean_shock_by_step 等诊断指标
+    """
     if not hasattr(model, 'forward'):
         return None
 
@@ -3331,20 +3915,6 @@ def summarize_fusion_diagnostics(model, data_loader, X_static_test,
     if diagnostics is None:
         print("Fusion diagnostics skipped: model returned no diagnostics.")
         return None
-
-    # 兼容 legacy_cross 返回的字典。
-    if 'legacy_attention' in diagnostics:
-        weights = diagnostics['legacy_attention'].detach().cpu().numpy()
-        avg_weights = weights.mean(axis=0).reshape(-1)
-        names = data_loader.temporal_step_names or [
-            f't{i}' for i in range(X_temporal_test.shape[1])
-        ]
-        if len(avg_weights) > len(names):
-            names = list(names) + ['multi_scale_context']
-        print("\nLegacy TS-CrossAttention context weights:")
-        for idx in np.argsort(avg_weights)[::-1][:min(10, len(avg_weights))]:
-            print(f"{names[idx]}: {avg_weights[idx]:.6f}")
-        return {'legacy_attention': avg_weights}
 
     result = {}
     local_attention = diagnostics.get('local_attention')
@@ -3389,30 +3959,36 @@ def summarize_fusion_diagnostics(model, data_loader, X_static_test,
     return result
 
 
-def summarize_cross_attention(model, data_loader, X_static_test,
-                              X_temporal_test, sample_size=256):
-    """向后兼容旧函数名。"""
-    return summarize_fusion_diagnostics(
-        model,
-        data_loader,
-        X_static_test,
-        X_temporal_test,
-        sample_size=sample_size
-    )
-
-
 def summarize_selective_risk(labels, predictions, ood_scores, ood_flags):
-    """计算拒判覆盖率与风险-覆盖曲线摘要。"""
+    """计算选择性风险（Selective Risk）：据 OOD 标记拒判后的覆盖率与精度。
+
+    当模型对某些样本发出 OOD 标记时，可选择拒判（不信任模型输出）。
+    本函数计算接受集（未被 OOD 标记）的覆盖率、准确率和召回率，
+    以及风险-覆盖曲线下面积（RC-AUC）。
+
+    Args:
+        labels: (N,) 真实标签
+        predictions: (N,) 模型预测
+        ood_scores: (N,) OOD 异常分数
+        ood_flags: (N,) bool OOD 标记
+
+    Returns:
+        dict: selective_coverage / selective_risk / selective_accuracy /
+              selective_sensitivity / risk_coverage_auc
+    """
     labels = np.asarray(labels)
     predictions = np.asarray(predictions)
     scores = np.asarray(ood_scores)
     flags = np.asarray(ood_flags, dtype=bool)
     accepted = ~flags
     errors = (predictions != labels).astype(np.float64)
+    # RC 曲线（Risk-Coverage）：按 OOD 分数从小到大逐步纳入样本，
+    # 累计错误率越低说明 OOD 分数与预测质量的相关性越强。
+    # RC-AUC = 累计风险曲线下面积，值越小越好。
     order = np.argsort(scores)
     cumulative_risk = (
         np.cumsum(errors[order])
-        / np.arange(1, len(errors) + 1)
+        / np.arange(1, len(errors) + 1)  # 除以前缀长度得到累积错误率
     )
     result = {
         'selective_coverage': float(accepted.mean()),
@@ -3439,7 +4015,23 @@ def summarize_selective_risk(labels, predictions, ood_scores, ood_flags):
 
 
 def summarize_group_fairness(labels, predictions, groups, min_group_size=20):
-    """输出审计用途的组间 TPR/FPR/Accuracy 差异，不参与模型训练。"""
+    """按人口统计分组输出审计用途的组间 TPR/FPR/Accuracy 差异。
+
+    对每个分组属性（如性别、年龄段），计算各组内的 Accuracy、TPR（召回率）、
+    FPR 和正向预测率，以及组间的最大-最小差距（gap）。
+    该分析仅用于审计，不参与模型训练。
+
+    Args:
+        labels: (N,) 真实标签
+        predictions: (N,) 模型预测
+        groups: {group_name: (N,) group_values} 分组字典
+        min_group_size: 组内最小样本数（低于此数的组不输出）
+
+    Returns:
+        (summaries, scalar_gaps):
+        - summaries: {group_name: {value: {n, accuracy, tpr, fpr, ...}}}
+        - scalar_gaps: {group_name_metric_gap: float} 各指标的组间最大差距
+    """
     labels = np.asarray(labels)
     predictions = np.asarray(predictions)
     summaries = {}
@@ -3485,7 +4077,18 @@ def bootstrap_metric_intervals(
     n_bootstrap=500,
     random_state=42,
 ):
-    """为核心测试指标提供非参数 95% 置信区间。"""
+    """为核心测试指标（Accuracy, Sensitivity, AUC, AUC-PR）提供非参数 95% bootstrap 置信区间。
+
+    Args:
+        labels: (N,) 真实标签
+        predictions: (N,) 模型预测
+        probabilities: (N,) 预测概率
+        n_bootstrap: bootstrap 重采样次数
+        random_state: 随机种子
+
+    Returns:
+        dict: 各指标的 {metric}_ci95_low / {metric}_ci95_high
+    """
     labels = np.asarray(labels)
     predictions = np.asarray(predictions)
     probabilities = np.asarray(probabilities)
@@ -3536,9 +4139,9 @@ def bootstrap_metric_intervals(
 def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path=None,
                    run_analysis=True, make_plots=True,
                    threshold_min_sensitivity=None, ood_quantile=0.99,
-                   fusion_type='global_local', seed=None,
+                   seed=None,
                    split_seed=42,
-                   hidden_dim=None, num_layers=None, num_heads=None,
+                   hidden_dim=None, num_layers=None,
                    dropout=None, lr=None, weight_decay=None,
                    loss_name='dynamic_focal', selection_metric='auc_pr',
                    threshold_objective='hybrid',
@@ -3551,15 +4154,47 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
                    auto_tune=False,
                    tune_epochs=10):
     """
-    运行完整实验
+    运行完整实验：数据加载 → 预处理 → 建模 → 训练 → 评估 → 分析。
+
+    实验流水线：
+    1. 加载数据集并做四层分割
+    2. 拟合 BlackSwanMonitor（OOD 监测）
+    3. 初始化 AA-BiLSTM 模型
+    4. 训练（含 auto-tune 可选超参搜索）
+    5. 测试集评估 + OOD 选择性风险 + 公平性审计 + Bootstrap CI
+    6. 可选：baselines 对比、消融实验、历史长度敏感性、不平衡鲁棒性
+    7. 可选：SHAP 解释 + 融合模块诊断 + 训练历史可视化
+
     Args:
         dataset_name: 'german' 或 'taiwan'
-        epoch: 训练轮数
-        batch_size: 批次大小
-        data_path: Taiwan 数据集路径，可传入 .xls/.xlsx/.csv
-        ood_quantile: 训练分布异常分数阈值分位数
-        fusion_type: 'global_local'（推荐）或 'legacy_cross'
-        loss_name: 'dynamic_focal'、'weighted_ce' 或 'cross_entropy'
+        epoch: 训练轮数（None 时使用数据集默认值）
+        batch_size: 批次大小（None 时使用数据集默认值）
+        data_path: 本地数据文件路径
+        run_analysis: 是否运行额外分析（baselines + 消融 + 鲁棒性 + SHAP）
+        make_plots: 是否生成训练曲线和混淆矩阵图
+        threshold_min_sensitivity: 阈值搜索的敏感性下限
+        ood_quantile: OOD 监测器的分位阈值
+        seed: 模型随机种子
+        split_seed: 数据分割随机种子
+        hidden_dim: 隐藏维度（None 时使用数据集默认值）
+        num_layers: 循环层数（None 时使用数据集默认值）
+        dropout: Dropout 比率（None 时使用数据集默认值）
+        lr: 学习率（None 时使用数据集默认值）
+        weight_decay: 权重衰减（None 时使用数据集默认值）
+        loss_name: 损失函数类型 ('dynamic_focal' / 'weighted_ce' / 'cross_entropy')
+        selection_metric: checkpoint 选择指标
+        threshold_objective: 阈值搜索目标
+        class_balance_power: 类别平衡幂指数
+        focal_gamma_max: focal loss 的 gamma_max
+        ema_decay: EMA 衰减率
+        calibrate_probabilities: 是否做 Platt 概率校准
+        analysis_on_test: 分析时使用测试集（默认使用验证集保护 holdout）
+        threshold_confidence: Wilson 下界的置信水平
+        auto_tune: 是否在最终训练前做轻量超参搜索
+        tune_epochs: 每个候选配置的调优 epoch 预算
+
+    Returns:
+        (model, test_metrics, history): 训练好的模型、测试指标字典、训练历史
     """
     dataset_name = dataset_name.lower()
     if dataset_name not in {'german', 'taiwan'}:
@@ -3599,7 +4234,6 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
         epoch = 30 if epoch is None else epoch
         hidden_dim = 64 if hidden_dim is None else hidden_dim
         num_layers = 2 if num_layers is None else num_layers
-        num_heads = 4 if num_heads is None else num_heads
         dropout = 0.25 if dropout is None else dropout
         lr = 8e-4 if lr is None else lr
         weight_decay = 2e-4 if weight_decay is None else weight_decay
@@ -3614,7 +4248,6 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
         epoch = 50 if epoch is None else epoch
         hidden_dim = 96 if hidden_dim is None else hidden_dim
         num_layers = 3 if num_layers is None else num_layers
-        num_heads = 4 if num_heads is None else num_heads
         dropout = 0.30 if dropout is None else dropout
         lr = 7e-4 if lr is None else lr
         weight_decay = 2e-4 if weight_decay is None else weight_decay
@@ -3629,14 +4262,11 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
         or epoch < 1
         or hidden_dim < 2
         or num_layers < 1
-        or num_heads < 1
     ):
         raise ValueError(
-            "batch_size, epoch, num_layers and num_heads must be positive; "
+            "batch_size, epoch, and num_layers must be positive; "
             "hidden_dim must be at least 2."
         )
-    if fusion_type == 'legacy_cross' and hidden_dim % num_heads != 0:
-        raise ValueError("hidden_dim must be divisible by num_heads.")
     if not 0.0 <= dropout < 1.0:
         raise ValueError("dropout must be in [0, 1).")
     if lr <= 0.0 or weight_decay < 0.0:
@@ -3689,7 +4319,8 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
     test_dataset = CreditDataset(X_static_test, X_temporal_test, y_test)
 
     pin_memory = torch.cuda.is_available()
-    # 数据已常驻内存；Windows spawn worker 的导入和复制成本通常高于收益。
+    # Windows 上 spawn 多进程 worker 的导入和序列化成本通常高于收益；
+    # 数据已常驻内存，单进程加载足够快。
     num_workers = (
         min(4, os.cpu_count() or 1)
         if torch.cuda.is_available() and os.name != 'nt'
@@ -3728,10 +4359,12 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
     static_dim = X_static_train.shape[1]
     temporal_steps = X_temporal_train.shape[1]
     temporal_dim = X_temporal_train.shape[2]
-    # German Credit 的“时序”由不同类别字段构造，并非真实月份；
-    # 局部突变注意力仅在 Taiwan 的真实月度序列上启用。
+    # German Credit 的”时序”由不同类别字段构造（伪时序），
+    # 各步之间没有真实的时间先后关系，局部突变注意力没有语义基础；
+    # 仅在 Taiwan 的真实月度序列上启用。
     enable_local_attention = dataset_name == 'taiwan'
 
+    # 模型工厂函数：支持 auto-tune 时用不同超参构建多个候选模型
     def build_model(candidate_hidden, candidate_layers, candidate_dropout):
         return AABiLSTM(
             static_dim=static_dim,
@@ -3741,18 +4374,13 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
             num_layers=candidate_layers,
             num_classes=2,
             dropout=candidate_dropout,
-            num_heads=num_heads,
-            use_cross_attention=True,
+            use_fusion=True,
             use_ag_resunit=True,
             bidirectional=True,
             use_multiscale=True,
-            fusion_type=fusion_type,
             local_window=min(3, temporal_steps),
             use_global_context=True,
-            use_local_attention=(
-                enable_local_attention
-                if fusion_type == 'global_local' else True
-            ),
+            use_local_attention=enable_local_attention,
             temporal_categorical_index=(
                 0 if dataset_name == 'taiwan' else None
             ),
@@ -3765,6 +4393,10 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
         )
 
     if auto_tune:
+        # 轻量级超参搜索：默认配置 + 2 个变体，不触及测试集。
+        # 候选 1：默认配置
+        # 候选 2：更小模型（75% hidden_dim，少一层）+ 更高 lr + 更低 dropout
+        # 候选 3：原尺寸但少一层 + 更高 dropout + 更低 lr
         compact_hidden = max(32, int(round(hidden_dim * 0.75 / 8)) * 8)
         candidates = [
             (hidden_dim, num_layers, dropout, lr),
@@ -3803,7 +4435,7 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
                 candidate_model,
                 train_loader,
                 val_loader,
-                val_loader,
+                val_loader,  # auto-tune 阶段不接触 test_loader，用 val_loader 代替
                 calibration_loader=calibration_loader,
                 num_epochs=min(tune_epochs, epoch),
                 lr=candidate_lr,
@@ -3853,9 +4485,7 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
     total_parameters = sum(p.numel() for p in model.parameters())
     fusion_parameters = (
         sum(p.numel() for p in model.feature_fusion.parameters())
-        if model.feature_fusion is not None else
-        sum(p.numel() for p in model.cross_attention.parameters())
-        if model.cross_attention is not None else 0
+        if model.feature_fusion is not None else 0
     )
     print(f"\nModel parameters: {total_parameters:,}")
     print(
@@ -3926,7 +4556,8 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
         test_metrics['probabilities'],
         random_state=split_seed,
     ))
-    # 便于同一 Python 进程内进行带拒判的部署推理；CLI 可另存 JSON 状态。
+    # 将部署所需的辅助状态绑定到模型上，方便同一进程内进行推理。
+    # CLI 可通过 --bundle / --checkpoint / --monitor-json 分别保存。
     model.black_swan_monitor = black_swan_monitor
     model.preprocessing_state = data_loader.export_preprocessing_state()
     model.training_config = {
@@ -3995,6 +4626,8 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
     )
     print(f"{'=' * 60}\n")
 
+    # 分析集选择：默认用验证集做 SHAP/消融/鲁棒性分析，保护测试集的"最终答案"地位；
+    # --analysis-on-test 可用于论文最终版本时在测试集上生成图表。
     analysis_static_eval = (
         X_static_test if analysis_on_test else X_static_val
     )
@@ -4025,7 +4658,6 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
                            epoch=min(epoch, 50),
                            hidden_dim=hidden_dim,
                            num_layers=num_layers,
-                           num_heads=num_heads,
                            dropout=dropout,
                            lr=lr,
                            weight_decay=weight_decay,
@@ -4041,7 +4673,6 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
             batch_size=batch_size,
             hidden_dim=hidden_dim,
             num_layers=num_layers,
-            num_heads=num_heads,
             dropout=dropout,
             preprocessor_template=data_loader,
             split_seed=split_seed,
@@ -4072,7 +4703,6 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
             batch_size=batch_size,
             hidden_dim=hidden_dim,
             num_layers=num_layers,
-            num_heads=num_heads,
             dropout=dropout,
             lr=lr,
             weight_decay=weight_decay,
@@ -4104,7 +4734,25 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
 def compare_baselines(X_static_train, X_temporal_train, y_train,
                       X_static_test, X_temporal_test, y_test,
                       deep_epochs=20, batch_size=128):
-    """与传统ML和深度学习基准模型对比。"""
+    """
+    与传统 ML 和深度序列基线模型进行全面对比。
+
+    传统模型（展平时序 → 单表输入）：
+    - Logistic Regression, Random Forest, SVM, DNN (MLP)
+    - XGBoost, LightGBM（可选）
+
+    深度序列模型（保留时序结构）：
+    - Standard LSTM, Bi-LSTM, Attention-LSTM, ResNet-LSTM
+
+    Args:
+        X_static_train/X_temporal_train/y_train: 训练数据
+        X_static_test/X_temporal_test/y_test: 测试数据
+        deep_epochs: 深度学习基线的训练轮数
+        batch_size: 批次大小
+
+    Returns:
+        dict: 各模型在测试集上的指标字典
+    """
     from sklearn.ensemble import RandomForestClassifier
 
     # 展平时序特征用于传统 ML，保持 DataFrame 格式以保留特征名
@@ -4234,31 +4882,52 @@ def compare_baselines(X_static_train, X_temporal_train, y_train,
 def run_ablation_study(static_dim, temporal_dim, temporal_steps,
                        train_loader, val_loader, test_loader,
                        calibration_loader=None, epoch=30,
-                       hidden_dim=64, num_layers=4, num_heads=4, dropout=0.3,
+                       hidden_dim=64, num_layers=4, dropout=0.3,
                        lr=1e-3, weight_decay=1e-4,
                        enable_local_attention=True):
     """
-    严格消融实验。
+    严格消融实验：逐一添加组件，量化每个模块对性能的增量贡献。
 
-    多尺度、旧交叉注意力、非线性全局聚合和局部冲击注意力分别控制，
-    避免原实现把 TS-CrossAttention 与 MultiScale 同时开启而混淆贡献。
+    消融顺序（渐进累积）：
+    1. Standard LSTM（基线，无任何增强）
+    2. + MultiScale only（仅多尺度编码）
+    3. Legacy CrossAttn（旧版交叉注意力 + 多尺度，同时开启全局+局部）
+    4. + Nonlinear Global（仅保留非线性全局聚合）
+    5. + Local Shock Attn（加入局部冲击注意力）
+    6. + AG-ResUnit（替换标准 LSTM 为 AG-ResUnit）
+    7. + Bi-Directional（开启双向）
+    8. + Dynamic Focal (Full)（启用动态 focal loss，完整模型）
+
+    每个配置独立训练并报告 AUC/AUC-PR/Accuracy/F1/Sensitivity/Specificity/参数量。
+
+    Args:
+        static_dim/temporal_dim/temporal_steps: 特征维度信息
+        train_loader/val_loader/test_loader: 数据加载器
+        calibration_loader: 校准集加载器
+        epoch: 每个消融配置的训练轮数
+        hidden_dim/num_layers/dropout/lr/weight_decay: 模型超参
+        enable_local_attention: 是否允许启用局部注意力
+
+    Returns:
+        list of dict: 每个消融配置的评估结果
     """
 
     print("\n" + "=" * 60)
     print("ABLATION STUDY")
     print("=" * 60)
 
+    # 消融配置：按组件逐一添加。use_cross 指旧版 TS-CrossAttention（被 AdaptiveFusion 替代）；
+    # 其余参数直接映射到 AABiLSTM 构造参数。
     configs = [
         {
-            'name': 'Standard LSTM',
+            'name': 'Standard LSTM',           # 纯 LSTM 基线，无任何增强
             'use_cross': False,
             'use_multiscale': False,
             'use_global': False,
             'use_local': False,
             'use_ag': False,
             'use_bi': False,
-            'use_focal': False,
-            'fusion_type': 'global_local'
+            'use_focal': False
         },
         {
             'name': '+ MultiScale only',
@@ -4268,8 +4937,7 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
             'use_local': False,
             'use_ag': False,
             'use_bi': False,
-            'use_focal': False,
-            'fusion_type': 'global_local'
+            'use_focal': False
         },
         {
             'name': 'Legacy CrossAttn',
@@ -4279,8 +4947,7 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
             'use_local': True,
             'use_ag': False,
             'use_bi': False,
-            'use_focal': False,
-            'fusion_type': 'legacy_cross'
+            'use_focal': False
         },
         {
             'name': '+ Nonlinear Global',
@@ -4290,8 +4957,7 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
             'use_local': False,
             'use_ag': False,
             'use_bi': False,
-            'use_focal': False,
-            'fusion_type': 'global_local'
+            'use_focal': False
         }
     ]
     if enable_local_attention:
@@ -4303,8 +4969,7 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
             'use_local': True,
             'use_ag': False,
             'use_bi': False,
-            'use_focal': False,
-            'fusion_type': 'global_local'
+            'use_focal': False
         })
 
     configs.extend([
@@ -4316,8 +4981,7 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
             'use_local': enable_local_attention,
             'use_ag': True,
             'use_bi': False,
-            'use_focal': False,
-            'fusion_type': 'global_local'
+            'use_focal': False
         },
         {
             'name': '+ Bi-Directional',
@@ -4327,8 +4991,7 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
             'use_local': enable_local_attention,
             'use_ag': True,
             'use_bi': True,
-            'use_focal': False,
-            'fusion_type': 'global_local'
+            'use_focal': False
         },
         {
             'name': '+ Dynamic Focal (Full)',
@@ -4338,8 +5001,7 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
             'use_local': enable_local_attention,
             'use_ag': True,
             'use_bi': True,
-            'use_focal': True,
-            'fusion_type': 'global_local'
+            'use_focal': True
         }
     ])
 
@@ -4358,17 +5020,15 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
             num_layers=num_layers,
             num_classes=2,
             dropout=dropout,
-            num_heads=num_heads,
-            use_cross_attention=config['use_cross'],
+            use_fusion=config['use_cross'],
             use_ag_resunit=config['use_ag'],
             bidirectional=config['use_bi'],
             use_multiscale=config['use_multiscale'],
-            fusion_type=config['fusion_type'],
             local_window=min(3, temporal_steps),
             use_global_context=config['use_global'],
             use_local_attention=config['use_local'],
             temporal_categorical_index=(
-                0 if enable_local_attention else None
+                0 if temporal_dim > 3 else None
             ),
             use_step_embedding=True,
             multiscale_mode='lightweight',
@@ -4431,7 +5091,18 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
 
 def subsample_training_rate(X_static_train, X_temporal_train, y_train,
                             target_default_rate, random_state=42):
-    """对某一类进行随机欠采样，调整训练集的违约率至目标水平"""
+    """对某一类进行随机欠采样，调整训练集的违约率至目标水平。
+
+    优先保持多数类完整，对少数类做欠采样；当少数类样本不足时反向操作。
+
+    Args:
+        X_static_train/X_temporal_train/y_train: 训练数据
+        target_default_rate: 目标违约率（0~1）
+        random_state: 随机种子
+
+    Returns:
+        三元组 (X_static, X_temporal, y): 欠采样后的训练数据
+    """
     if not 0 < target_default_rate < 1:
         raise ValueError("target_default_rate must be between 0 and 1.")
 
@@ -4442,6 +5113,9 @@ def subsample_training_rate(X_static_train, X_temporal_train, y_train,
     if len(pos_idx) == 0 or len(neg_idx) == 0:
         raise ValueError("Both classes are required for imbalance robustness study.")
 
+    # 策略：优先保持多数类完整，对少数类做欠采样；
+    # 当少数类样本不足以达到目标比例时，反向操作——欠采样多数类。
+    # 公式：target_rate = pos / (pos + neg) → pos = target_rate/(1-target_rate) * neg
     desired_pos_if_all_neg = int(round(target_default_rate / (1 - target_default_rate) * len(neg_idx)))
     if 1 <= desired_pos_if_all_neg <= len(pos_idx):
         keep_pos = rng.choice(pos_idx, size=desired_pos_if_all_neg, replace=False)
@@ -4464,10 +5138,25 @@ def run_imbalance_robustness_study(X_static_train, X_temporal_train, y_train,
                                    X_static_test, X_temporal_test, y_test,
                                    target_rates=(0.02, 0.05, 0.10, 0.22, 0.30),
                                    epoch=20, batch_size=128, hidden_dim=128,
-                                   num_layers=8, num_heads=8, dropout=0.4,
+                                   num_layers=8, dropout=0.4,
                                    lr=5e-4, weight_decay=2e-4,
                                    enable_local_attention=True):
-    """在受控的训练集违约率下评估模型的鲁棒性"""
+    """
+    类别不平衡鲁棒性实验：在不同训练集违约率下比较 Standard LSTM 与 AA-BiLSTM。
+
+    通过 subsample_training_rate 将训练集违约率调整到 {2%, 5%, 10%, 22%, 30%}，
+    每种失衡程度下独立训练 Standard LSTM 和 AA-BiLSTM，对比 AUC 和 Sensitivity，
+    评估模型在极端少数类场景下的鲁棒性。
+
+    Args:
+        X_static_train/.../y_test: 完整数据集按四层分割后的各子集
+        target_rates: 要测试的目标违约率序列
+        epoch/batch_size/hidden_dim/.../lr/weight_decay: 模型超参
+        enable_local_attention: 是否启用局部注意力
+
+    Returns:
+        list of dict: 每种违约率下两个模型的评估结果
+    """
     print("\n" + "=" * 60)
     print("IMBALANCE ROBUSTNESS STUDY")
     print("=" * 60)
@@ -4496,6 +5185,8 @@ def run_imbalance_robustness_study(X_static_train, X_temporal_train, y_train,
 
     results = []
     for rate in target_rates:
+        # 每种违约率使用 deterministic seed：rate*10000 将 0.02→200、0.30→3000，
+        # 加 42 偏移避免与全局 seed 碰撞，同时保证不同 rate 有不同但可复现的初始化
         set_seed(int(rate * 10000) + 42)
         try:
             xs_train, xt_train, ys_train = subsample_training_rate(
@@ -4546,17 +5237,15 @@ def run_imbalance_robustness_study(X_static_train, X_temporal_train, y_train,
             num_layers=num_layers,
             num_classes=2,
             dropout=dropout,
-            num_heads=num_heads,
-            use_cross_attention=True,
+            use_fusion=True,
             use_ag_resunit=True,
             bidirectional=True,
             use_multiscale=True,
-            fusion_type='global_local',
             local_window=min(3, X_temporal_train.shape[1]),
             use_global_context=True,
             use_local_attention=enable_local_attention,
             temporal_categorical_index=(
-                0 if enable_local_attention else None
+                0 if X_temporal_train.shape[2] > 3 else None
             ),
             use_step_embedding=True,
             multiscale_mode='lightweight',
@@ -4593,7 +5282,7 @@ def run_imbalance_robustness_study(X_static_train, X_temporal_train, y_train,
 def run_history_length_study(static_features, temporal_features, y, dataset_name,
                              history_lengths=(3, 6, 12, 24, 36), epoch=30,
                              batch_size=128, hidden_dim=128, num_layers=8,
-                             num_heads=8, dropout=0.4, extend_method=None,
+                             dropout=0.4, extend_method=None,
                              preprocessor_template=None, split_seed=42):
     """
     长期依赖能力验证。支持数据扩展以测试更长时间窗口。
@@ -4629,12 +5318,10 @@ def run_history_length_study(static_features, temporal_features, y, dataset_name
                 'num_layers': num_layers,
                 'num_classes': 2,
                 'dropout': dropout,
-                'num_heads': num_heads,
-                'use_cross_attention': True,
+                'use_fusion': True,
                 'use_ag_resunit': True,
                 'bidirectional': True,
                 'use_multiscale': True,
-                'fusion_type': 'global_local',
                 'local_window': 3,
                 'use_global_context': True,
                 'use_local_attention': dataset_name == 'taiwan',
@@ -4671,7 +5358,8 @@ def run_history_length_study(static_features, temporal_features, y, dataset_name
                 results[name].append({'history_length': length, 'auc': None, 'status': 'skipped'})
             continue
 
-        # 更新temporal_step_names
+        # 每种历史长度需要独立的 data_loader 实例；
+        # deepcopy 避免修改原始 preprocessor 的状态（如 scaler、split_indices_）
         data_loader = (
             copy.deepcopy(preprocessor_template)
             if preprocessor_template is not None
@@ -4783,7 +5471,12 @@ def run_history_length_study(static_features, temporal_features, y, dataset_name
 
 
 def plot_training_history(history, dataset_name):
-    """绘制训练历史"""
+    """绘制训练历史四联图：Loss / AUC / AUC-PR / F1-Score。
+
+    Args:
+        history: Trainer.history 字典，含 train_loss, val_auc, val_auc_pr, val_f1
+        dataset_name: 数据集名（用于图表标题和文件名）
+    """
     fig, axes = plt.subplots(1, 4, figsize=(18, 4))
 
     # 损失曲线
@@ -4824,7 +5517,13 @@ def plot_training_history(history, dataset_name):
 
 
 def plot_confusion_matrix(y_true, y_pred, dataset_name):
-    """绘制混淆矩阵"""
+    """绘制并保存混淆矩阵热力图（Normal vs Default）。
+
+    Args:
+        y_true: 真实标签
+        y_pred: 预测标签
+        dataset_name: 数据集名（用于图表标题和文件名）
+    """
     cm = confusion_matrix(y_true, y_pred)
     plt.figure(figsize=(6, 5))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
@@ -4838,450 +5537,26 @@ def plot_confusion_matrix(y_true, y_pred, dataset_name):
     plt.close()
 
 
-def transform_encoded_features(
-    static_features,
-    temporal_features,
-    preprocessing_state,
-):
-    """
-    使用 bundle 中的训练缩放器变换已按保存特征顺序编码的数据。
-
-    原始 CSV/Excel 仍应先经过对应的 load_german_credit/load_taiwan_credit
-    特征工程；本函数负责最后一步连续变量标准化。
-    """
-    static = np.asarray(static_features, dtype=np.float32).copy()
-    temporal = np.asarray(temporal_features, dtype=np.float32).copy()
-    static_names = preprocessing_state.get('static_feature_names') or []
-    if static.ndim != 2 or temporal.ndim != 3:
-        raise ValueError("Expected static [N,S] and temporal [N,T,F].")
-    if static_names and static.shape[1] != len(static_names):
-        raise ValueError(
-            f"Expected {len(static_names)} static features, "
-            f"got {static.shape[1]}."
-        )
-
-    continuous = preprocessing_state.get('continuous_static_cols')
-    static_scaler = preprocessing_state.get('static_scaler')
-    if continuous is not None and static_scaler is not None:
-        mask = np.asarray(continuous, dtype=bool)
-        mean = np.asarray(static_scaler['mean'], dtype=np.float32)
-        scale = np.asarray(static_scaler['scale'], dtype=np.float32)
-        static[:, mask] = (static[:, mask] - mean) / np.maximum(
-            scale,
-            1e-7,
-        )
-
-    temporal_scaler = preprocessing_state.get('temporal_scaler')
-    if temporal_scaler is not None:
-        mean = np.asarray(temporal_scaler['mean'], dtype=np.float32)
-        scale = np.asarray(temporal_scaler['scale'], dtype=np.float32)
-        continuous_temporal = preprocessing_state.get(
-            'continuous_temporal_cols'
-        )
-        if continuous_temporal is None:
-            continuous_temporal = np.ones(
-                temporal.shape[-1],
-                dtype=bool,
-            )
-        continuous_temporal = np.asarray(
-            continuous_temporal,
-            dtype=bool,
-        )
-        if (
-            len(continuous_temporal) != temporal.shape[-1]
-            or int(continuous_temporal.sum()) != len(mean)
-        ):
-            raise ValueError(
-                "Temporal scaler mask is incompatible with the supplied "
-                f"feature dimension {temporal.shape[-1]}."
-            )
-        temporal[:, :, continuous_temporal] = (
-            temporal[:, :, continuous_temporal]
-            - mean.reshape(1, 1, -1)
-        ) / np.maximum(scale.reshape(1, 1, -1), 1e-7)
-    return static.astype(np.float32), temporal.astype(np.float32)
-
-
-def _read_raw_credit_frame(raw_data, dataset_name):
-    if isinstance(raw_data, pd.DataFrame):
-        return raw_data.copy()
-    path = str(raw_data).strip().strip('"').strip("'")
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Raw inference file not found: {path}")
-    if dataset_name == 'german':
-        return pd.read_csv(path, sep=r"\s+", header=None)
-    extension = os.path.splitext(path)[1].lower()
-    if extension in {'.xls', '.xlsx'}:
-        return pd.read_excel(path, header=1)
-    return pd.read_csv(path)
-
-
-def _engineer_raw_german(frame, preprocessing_state):
-    if frame.shape[1] not in {20, 21}:
-        raise ValueError(
-            "German raw input must contain 20 feature columns and may "
-            "optionally include the label column."
-        )
-    features = frame.iloc[:, :20].copy()
-    features.columns = list(range(20))
-    numeric_cols = [
-        int(value)
-        for value in preprocessing_state.get(
-            'raw_static_numeric_names',
-            [1, 4, 7, 10, 12, 15, 17],
-        )
-    ]
-    categorical_cols = [
-        int(value)
-        for value in preprocessing_state.get(
-            'raw_static_categorical_names',
-            [9, 11, 13, 14, 16, 18, 19],
-        )
-    ]
-    prefixes = preprocessing_state.get(
-        'raw_static_prefixes',
-        [f'A{column}' for column in categorical_cols],
-    )
-    numeric = features[numeric_cols].astype(np.float32).to_numpy()
-    categorical = features[categorical_cols].astype(str)
-    categorical.columns = [str(column) for column in categorical_cols]
-    dummy = pd.get_dummies(
-        categorical,
-        prefix=prefixes,
-        drop_first=False,
-        dtype=np.float32,
-    )
-    expected_dummy = preprocessing_state.get('static_dummy_columns') or []
-    dummy = dummy.reindex(columns=expected_dummy, fill_value=0.0)
-    static = np.concatenate(
-        [numeric, dummy.to_numpy(dtype=np.float32)],
-        axis=1,
-    )
-
-    selected_cols = preprocessing_state.get('german_selected_cols')
-    mappings = preprocessing_state.get('german_temporal_maps')
-    risk_priors = preprocessing_state.get('german_risk_priors') or {}
-    if not selected_cols or not mappings:
-        raise ValueError(
-            "The bundle does not contain German raw-category mappings."
-        )
-    temporal_steps = []
-    for step, column in enumerate(selected_cols):
-        values = features[int(column)].astype(str).to_numpy()
-        mapping = mappings[step]
-        code_map = {
-            str(key): float(value)
-            for key, value in mapping['code'].items()
-        }
-        frequency_map = {
-            str(key): float(value)
-            for key, value in mapping['frequency'].items()
-        }
-        column_priors = (
-            risk_priors.get(int(column))
-            or risk_priors.get(str(column))
-            or {}
-        )
-        category_code = np.asarray(
-            [code_map.get(value, 0.5) for value in values],
-            dtype=np.float32,
-        )
-        risk_prior = np.asarray(
-            [
-                column_priors.get(
-                    value,
-                    code_map.get(value, 0.5),
-                )
-                for value in values
-            ],
-            dtype=np.float32,
-        )
-        category_frequency = np.asarray(
-            [frequency_map.get(value, 0.0) for value in values],
-            dtype=np.float32,
-        )
-        temporal_steps.append(np.stack(
-            [category_code, risk_prior, category_frequency],
-            axis=1,
-        ))
-    temporal = np.stack(temporal_steps, axis=1)
-    return static, temporal
-
-
-def _engineer_raw_taiwan(frame, preprocessing_state):
-    frame = frame.copy()
-    frame.columns = [str(column).strip() for column in frame.columns]
-    frame = frame.rename(columns={
-        'default payment next month': 'default.payment.next.month',
-    })
-    static_num_cols = ['LIMIT_BAL', 'AGE']
-    static_cat_cols = ['SEX', 'EDUCATION', 'MARRIAGE']
-    status_cols = ['PAY_0', 'PAY_2', 'PAY_3', 'PAY_4', 'PAY_5', 'PAY_6']
-    bill_cols = [
-        'BILL_AMT1', 'BILL_AMT2', 'BILL_AMT3',
-        'BILL_AMT4', 'BILL_AMT5', 'BILL_AMT6',
-    ]
-    payment_cols = [
-        'PAY_AMT1', 'PAY_AMT2', 'PAY_AMT3',
-        'PAY_AMT4', 'PAY_AMT5', 'PAY_AMT6',
-    ]
-    required = (
-        static_num_cols + static_cat_cols + status_cols
-        + bill_cols + payment_cols
-    )
-    missing = [column for column in required if column not in frame.columns]
-    if missing:
-        raise ValueError(
-            f"Taiwan raw input is missing required columns: {missing}"
-        )
-
-    limit_balance = np.maximum(
-        frame['LIMIT_BAL'].astype(float).to_numpy(),
-        1.0,
-    )
-    bills = frame[bill_cols].astype(float).to_numpy()
-    payments = frame[payment_cols].astype(float).to_numpy()
-    statuses = frame[status_cols].astype(float).to_numpy()
-    utilization = np.clip(
-        bills / limit_balance[:, None],
-        -10.0,
-        10.0,
-    )
-    payment_to_bill = np.clip(
-        payments / np.maximum(np.abs(bills), 1.0),
-        -10.0,
-        10.0,
-    )
-    chronological_bill = utilization[:, ::-1]
-    trend_axis = np.arange(6, dtype=np.float32)
-    trend_axis -= trend_axis.mean()
-    bill_trend = (
-        chronological_bill @ trend_axis
-    ) / max(float(np.square(trend_axis).sum()), 1e-7)
-    engineered = pd.DataFrame({
-        'recent_bill_to_limit': utilization[:, 0],
-        'avg_bill_to_limit_6m': utilization.mean(axis=1),
-        'max_bill_to_limit_6m': utilization.max(axis=1),
-        'bill_trend_6m': bill_trend,
-        'recent_payment_shock': statuses[:, 0] - statuses[:, 1],
-        'delinquency_count_6m': (statuses > 0).sum(axis=1),
-        'max_delinquency_6m': statuses.max(axis=1),
-        'recent_payment_to_bill': payment_to_bill[:, 0],
-        'avg_payment_to_bill_6m': payment_to_bill.mean(axis=1),
-    }).clip(-10.0, 10.0)
-    numeric = pd.concat(
-        [
-            frame[static_num_cols].astype(np.float32).reset_index(drop=True),
-            engineered.astype(np.float32).reset_index(drop=True),
-        ],
-        axis=1,
-    ).to_numpy(dtype=np.float32)
-    categorical = frame[static_cat_cols].astype(str)
-    dummy = pd.get_dummies(
-        categorical,
-        prefix=static_cat_cols,
-        drop_first=False,
-        dtype=np.float32,
-    )
-    expected_dummy = preprocessing_state.get('static_dummy_columns') or []
-    dummy = dummy.reindex(columns=expected_dummy, fill_value=0.0)
-    static = np.concatenate(
-        [numeric, dummy.to_numpy(dtype=np.float32)],
-        axis=1,
-    )
-
-    bill_signal = np.sign(bills) * np.log1p(np.abs(bills))
-    payment_signal = np.sign(payments) * np.log1p(np.abs(payments))
-    temporal = np.stack(
-        [
-            statuses,
-            bill_signal,
-            payment_signal,
-            utilization,
-            payment_to_bill,
-        ],
-        axis=-1,
-    )[:, ::-1, :].copy().astype(np.float32)
-    return static, temporal
-
-
-def transform_raw_credit_data(raw_data, preprocessing_state, dataset_name=None):
-    """
-    Convert a raw German/Taiwan file or DataFrame to model-ready arrays.
-
-    Category vocabularies, column order and scalers come only from the
-    training bundle. Unknown categories are represented by all-zero dummy
-    vectors (or the model's unknown temporal-state embedding).
-    """
-    if not preprocessing_state:
-        raise ValueError("A preprocessing_state is required.")
-    dataset_name = (
-        dataset_name or preprocessing_state.get('dataset_name')
-    )
-    if dataset_name not in {'german', 'taiwan'}:
-        raise ValueError(
-            "dataset_name must be 'german' or 'taiwan'."
-        )
-    frame = _read_raw_credit_frame(raw_data, dataset_name)
-    if dataset_name == 'german':
-        static, temporal = _engineer_raw_german(
-            frame,
-            preprocessing_state,
-        )
-    else:
-        static, temporal = _engineer_raw_taiwan(
-            frame,
-            preprocessing_state,
-        )
-    return transform_encoded_features(
-        static,
-        temporal,
-        preprocessing_state,
-    )
-
-
-def predict_raw_credit(model, raw_data, dataset_name=None, **predict_kwargs):
-    """End-to-end raw CSV/Excel/DataFrame inference with schema validation."""
-    preprocessing_state = getattr(model, 'preprocessing_state', None)
-    static, temporal = transform_raw_credit_data(
-        raw_data,
-        preprocessing_state,
-        dataset_name=dataset_name,
-    )
-    result = predict_with_rejection(
-        model,
-        static,
-        temporal,
-        **predict_kwargs,
-    )
-    result['static_features'] = static
-    result['temporal_features'] = temporal
-    return result
-
-
-def predict_with_rejection(model, static_features, temporal_features,
-                           decision_threshold=None, monitor=None,
-                           entropy_threshold=None, batch_size=512,
-                           temperature=None, calibration_scale=None,
-                           calibration_bias=None):
-    """
-    对已按训练 scaler 变换的数据进行带拒判的推理。
-
-    decision=-1 表示输入分布异常或预测熵过高，应进入人工复核；0/1 分别
-    表示正常/违约。OOD 检测不是分类标签，不能直接把异常样本当作违约。
-    """
-    static_features = np.asarray(static_features, dtype=np.float32)
-    temporal_features = np.asarray(temporal_features, dtype=np.float32)
-    if static_features.shape[0] != temporal_features.shape[0]:
-        raise ValueError("Static and temporal sample counts must match.")
-    if len(static_features) == 0:
-        raise ValueError("At least one sample is required for inference.")
-    if static_features.ndim != 2 or temporal_features.ndim != 3:
-        raise ValueError(
-            "Expected static [N, S] and temporal [N, T, F] arrays."
-        )
-    if decision_threshold is None:
-        decision_threshold = getattr(model, 'decision_threshold', 0.5)
-    if calibration_scale is None:
-        calibration_scale = getattr(model, 'calibration_scale', None)
-    if calibration_bias is None:
-        calibration_bias = getattr(model, 'calibration_bias', 0.0)
-    if temperature is not None:
-        calibration_scale = 1.0 / float(temperature)
-        calibration_bias = 0.0
-    elif calibration_scale is None:
-        temperature = getattr(model, 'temperature', 1.0)
-        calibration_scale = 1.0 / float(temperature)
-    if entropy_threshold is None:
-        entropy_threshold = getattr(model, 'entropy_threshold', 0.65)
-    decision_threshold = float(decision_threshold)
-    calibration_scale = float(calibration_scale)
-    calibration_bias = float(calibration_bias)
-    temperature = 1.0 / max(calibration_scale, 1e-7)
-    entropy_threshold = float(entropy_threshold)
-    if not 0.0 <= decision_threshold <= 1.0:
-        raise ValueError("decision_threshold must be in [0, 1].")
-    if (
-        not np.isfinite(calibration_scale)
-        or calibration_scale <= 0.0
-        or not np.isfinite(calibration_bias)
-    ):
-        raise ValueError(
-            "Calibration scale must be positive and calibration parameters "
-            "must be finite."
-        )
-    if not 0.0 <= entropy_threshold <= np.log(2.0):
-        raise ValueError("entropy_threshold must be in [0, log(2)].")
-    if batch_size < 1:
-        raise ValueError("batch_size must be positive.")
-
-    monitor = monitor or getattr(model, 'black_swan_monitor', None)
-    if monitor is None:
-        raise ValueError(
-            "A fitted BlackSwanMonitor is required for rejection inference."
-        )
-
-    model_device = next(model.parameters()).device
-    model.eval()
-    probability_batches = []
-    with torch.inference_mode():
-        for start in range(0, len(static_features), batch_size):
-            end = start + batch_size
-            static = torch.as_tensor(
-                static_features[start:end],
-                device=model_device
-            )
-            temporal = torch.as_tensor(
-                temporal_features[start:end],
-                device=model_device
-            )
-            logits = model(static, temporal).float()
-            margin = logits[:, 1] - logits[:, 0]
-            positive_probability = torch.sigmoid(
-                calibration_scale * margin + calibration_bias
-            )
-            probability_batches.append(
-                torch.stack(
-                    [1.0 - positive_probability, positive_probability],
-                    dim=-1,
-                ).cpu().numpy()
-            )
-
-    probabilities = np.concatenate(probability_batches, axis=0)
-    positive_probability = probabilities[:, 1]
-    predictions = (
-        positive_probability >= decision_threshold
-    ).astype(np.int64)
-    predictive_entropy = -np.sum(
-        probabilities * np.log(probabilities + 1e-12), axis=1
-    )
-    ood_scores, ood_flags = monitor.score(
-        static_features, temporal_features
-    )
-    uncertainty_flags = predictive_entropy > entropy_threshold
-    review_flags = ood_flags | uncertainty_flags
-    decisions = predictions.copy()
-    decisions[review_flags] = -1
-
-    return {
-        'decisions': decisions,
-        'predictions': predictions,
-        'probabilities': positive_probability,
-        'predictive_entropy': predictive_entropy,
-        'ood_scores': ood_scores,
-        'ood_flags': ood_flags,
-        'uncertainty_flags': uncertainty_flags,
-        'review_flags': review_flags,
-        'decision_threshold': decision_threshold,
-        'temperature': temperature,
-        'calibration_scale': calibration_scale,
-        'calibration_bias': calibration_bias,
-        'entropy_threshold': entropy_threshold,
-    }
-
-
 def save_experiment_bundle(path, model, metrics=None):
-    """保存可复现实验和部署决策所需的完整状态。"""
+    """保存完整的实验与部署 bundle（PyTorch .pt 格式）。
+
+    bundle 包含：
+    - 模型配置与权重（state_dict）
+    - 决策阈值、温度、校准参数
+    - BlackSwanMonitor 状态
+    - 预处理状态（特征名/缩放器/类别映射）
+    - 训练配置与评估指标标量值
+    - 公平性审计详情
+
+    Args:
+        path: 保存路径
+        model: 训练好的 AABiLSTM（需附加 model_config / preprocessing_state /
+               training_config / black_swan_monitor 等属性）
+        metrics: 评估指标字典（可选）
+
+    Returns:
+        bundle: 被保存的完整字典
+    """
     monitor = getattr(model, 'black_swan_monitor', None)
     bundle = {
         'format_version': 3,
@@ -5328,53 +5603,16 @@ def save_experiment_bundle(path, model, metrics=None):
     return bundle
 
 
-def load_experiment_bundle(path, map_location='cpu'):
-    """恢复模型、阈值、温度和 OOD 监控器。"""
-    try:
-        bundle = torch.load(
-            path,
-            map_location=map_location,
-            weights_only=False,
-        )
-    except TypeError:
-        bundle = torch.load(path, map_location=map_location)
-    format_version = bundle.get('format_version')
-    if format_version not in {2, 3}:
-        raise ValueError("Unsupported experiment bundle format.")
-    model = AABiLSTM(**bundle['model_config'])
-    model.load_state_dict(
-        bundle['model_state_dict'],
-        strict=format_version >= 3,
-    )
-    model.decision_threshold = float(bundle['decision_threshold'])
-    model.temperature = float(bundle['temperature'])
-    model.calibration_scale = float(
-        bundle.get(
-            'calibration_scale',
-            1.0 / max(model.temperature, 1e-7),
-        )
-    )
-    model.calibration_bias = float(
-        bundle.get('calibration_bias', 0.0)
-    )
-    model.entropy_threshold = float(
-        bundle.get('entropy_threshold', 0.65)
-    )
-    model.preprocessing_state = bundle.get('preprocessing_state')
-    model.training_config = bundle.get('training_config')
-    monitor_state = bundle.get('black_swan_monitor')
-    if monitor_state is not None:
-        model.black_swan_monitor = BlackSwanMonitor.from_dict(
-            monitor_state
-        )
-    return model.to(map_location), bundle
-
-
 # ==============================
 # 7. 运行入口
 # ==============================
 
 def parse_args():
+    """解析命令行参数，返回论文对齐的 AA-BiLSTM 信用风险实验配置。
+
+    Returns:
+        argparse.Namespace: 含所有实验参数的对象
+    """
     parser = argparse.ArgumentParser(
         description='Paper-aligned AA-BiLSTM credit-risk experiment.'
     )
@@ -5410,8 +5648,6 @@ def parse_args():
                         help='Override the dataset-specific hidden size.')
     parser.add_argument('--num-layers', type=int, default=None,
                         help='Override the dataset-specific recurrent depth.')
-    parser.add_argument('--num-heads', type=int, default=None,
-                        help='Attention heads used only by legacy_cross fusion.')
     parser.add_argument('--dropout', type=float, default=None,
                         help='Override dropout in [0, 1).')
     parser.add_argument('--learning-rate', type=float, default=None,
@@ -5441,7 +5677,7 @@ def parse_args():
         type=float,
         default=None,
         help=(
-            'Validation sensitivity floor (default: 0.65 German / '
+            'Validation sensitivity floor (default: 0.50 German / '
             '0.55 Taiwan).'
         ),
     )
@@ -5485,12 +5721,6 @@ def parse_args():
         type=float,
         default=None,
         help='Override EMA decay (default: 0.99 German / 0.995 Taiwan).',
-    )
-    parser.add_argument(
-        '--fusion',
-        choices=['global_local', 'legacy_cross'],
-        default='global_local',
-        help='Feature fusion: recommended nonlinear global-local or legacy cross-attention.'
     )
     parser.add_argument(
         '--ood-quantile',
@@ -5568,6 +5798,14 @@ def parse_args():
 
 
 def scalar_metrics(metrics):
+    """从指标字典中提取可序列化的标量值，排除大数组（predictions/probabilities/labels/ood_*）。
+
+    Args:
+        metrics: 完整的评估指标字典
+
+    Returns:
+        dict: 仅含标量值的子集，适合 JSON 序列化
+    """
     result = {}
     for key, value in metrics.items():
         if key in {
@@ -5583,7 +5821,18 @@ def scalar_metrics(metrics):
 
 
 def attach_repeat_summary(primary_metrics, metric_rows):
-    """把多次独立运行的均值、标准差和均值置信区间加入主结果。"""
+    """把多次独立运行的均值、标准差和 95% 均值置信区间附加到主结果字典。
+
+    对 Accuracy, Sensitivity, Specificity, Balanced Accuracy, F1, AUC, AUC-PR,
+    Brier Score 这 8 个核心指标分别计算统计量。
+
+    Args:
+        primary_metrics: 主结果字典（原地修改）
+        metric_rows: 各次运行的指标字典列表
+
+    Returns:
+        primary_metrics（已原地修改，含 repeat_* 前缀的汇总统计量）
+    """
     keys = (
         'accuracy',
         'sensitivity',
@@ -5623,19 +5872,22 @@ def attach_repeat_summary(primary_metrics, metric_rows):
     return primary_metrics
 
 
+# ============================================================
+# 命令行入口：交互模式或参数模式
+# ============================================================
 if __name__ == '__main__':
     args = parse_args()
 
     dataset_name = args.dataset
     if dataset_name is None:
         print("=" * 40)
-        print("可用数据集：german / taiwan")
+        print("Available datasets: german / taiwan")
         while True:
-            choice = input("请输入选择的数据集：").strip().lower()
+            choice = input("Enter dataset (german/taiwan): ").strip().lower()
             if choice in {'german', 'taiwan'}:
                 dataset_name = choice
                 break
-            print("输入无效，请输入‘german’或‘taiwan’")
+            print("Invalid input. Enter 'german' or 'taiwan'.")
 
     run_analysis = args.run_analysis
     if run_analysis is None:
@@ -5643,11 +5895,11 @@ if __name__ == '__main__':
             run_analysis = False
         else:
             while True:
-                ans = input("是否进行验证环节（包含基准模型对比、消融实验）（Y/N）：").strip().upper()
+                ans = input("Run analysis (baselines + ablation)? (Y/N): ").strip().upper()
                 if ans in {'Y', 'N'}:
                     run_analysis = (ans == 'Y')
                     break
-                print("输入无效，请输入 Y 或 N。")
+                print("Invalid input. Enter Y or N.")
 
     make_plots = args.make_plots
     if make_plots is None:
@@ -5655,11 +5907,11 @@ if __name__ == '__main__':
             make_plots = False
         else:
             while True:
-                ans = input("是否绘图（Y/N）：").strip().upper()
+                ans = input("Generate plots? (Y/N): ").strip().upper()
                 if ans in {'Y', 'N'}:
                     make_plots = (ans == 'Y')
                     break
-                print("输入无效，请输入 Y 或 N。")
+                print("Invalid input. Enter Y or N.")
 
     print("Starting experiments...")
 
@@ -5674,12 +5926,10 @@ if __name__ == '__main__':
         make_plots=make_plots,
         threshold_min_sensitivity=args.min_sensitivity,
         ood_quantile=args.ood_quantile,
-        fusion_type=args.fusion,
         seed=args.seed,
         split_seed=args.split_seed,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
-        num_heads=args.num_heads,
         dropout=args.dropout,
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
@@ -5698,6 +5948,8 @@ if __name__ == '__main__':
     model, metrics, history = run_experiment(**experiment_kwargs)
 
     repeated_metrics = [metrics]
+    # 多次独立运行：固定数据分割，仅改变模型 seed，分离初始化方差；
+    # 若 --vary-split-seed 则同时改变分割，评估分割稳定性。
     if args.repeat_runs > 1:
         base_model_seed = (
             args.seed
@@ -5711,6 +5963,7 @@ if __name__ == '__main__':
             )
             repeated_kwargs = dict(experiment_kwargs)
             repeated_kwargs.update({
+                # 1009 是一个素数，避免多次运行 seed 产生周期性重复模式
                 'seed': base_model_seed + 1009 * repeat_idx,
                 'split_seed': (
                     args.split_seed + 1009 * repeat_idx
