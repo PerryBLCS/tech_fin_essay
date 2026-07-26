@@ -80,7 +80,6 @@ def set_seed(seed, deterministic=True):
         torch.backends.cudnn.benchmark = not deterministic
 
 
-set_seed(42)
 # 设备选择：优先使用 CUDA GPU，否则回退到 CPU
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # 启用高精度矩阵乘法（PyTorch 2.0+ 支持），提升 float32 计算精度
@@ -803,9 +802,10 @@ class CreditDataLoader:
             split_seed: 分层分割随机种子
 
         Returns:
-            12 元组: (X_static_train, X_temporal_train, y_train,
-                       X_static_val, X_temporal_val, y_val,
-                       X_static_test, X_temporal_test, y_test)
+            9 元组: (X_static_train, X_temporal_train, y_train,
+                      X_static_val, X_temporal_val, y_val,
+                      X_static_test, X_temporal_test, y_test)
+            注：校准集数据存储在 self.calibration_data_ 属性中
         """
         static_features = np.asarray(static_features, dtype=np.float32)
         temporal_features = np.asarray(temporal_features, dtype=np.float32)
@@ -1337,6 +1337,18 @@ class AdaptiveFusion(nn.Module):
         self.output_norm = nn.LayerNorm(hidden_dim)
 
     @staticmethod
+    def _compute_shock_score(temporal_feat):
+        """计算每个时间步的冲击强度 = sqrt(mean(delta²))。
+
+        使用 delta 的 L2 范数度量相邻步之间的整体变化幅度。
+        +1e-8 防止 sqrt(0) 反向传播时产生无穷梯度。
+        """
+        delta = torch.zeros_like(temporal_feat)
+        if temporal_feat.shape[1] > 1:
+            delta[:, 1:] = temporal_feat[:, 1:] - temporal_feat[:, :-1]
+        return (delta.square().mean(dim=-1) + 1e-8).sqrt()
+
+    @staticmethod
     def _temporal_statistics(temporal_feat):
         """提取时序的五种全局统计量。
 
@@ -1389,13 +1401,12 @@ class AdaptiveFusion(nn.Module):
         """
         batch_size, time_steps, hidden_dim = temporal_feat.shape
 
+        # delta: 一阶差分，同时用于构建 event token 和计算 shock_score
         delta = torch.zeros_like(temporal_feat)
         if time_steps > 1:
             delta[:, 1:] = temporal_feat[:, 1:] - temporal_feat[:, :-1]
-        # t=0 的 delta 恒为 0；直接 sqrt(0) 的反向导数为无穷，会在第一
-        # 个优化步骤后污染全部参数。加小量保证梯度有限。
+        # shock_score = sqrt(mean(delta²))，+1e-8 防 sqrt(0) 梯度爆炸
         shock_score = (delta.square().mean(dim=-1) + 1e-8).sqrt()
-
         event_tokens = self.event_encoder(
             torch.cat([temporal_feat, delta, delta.abs()], dim=-1)
         )
@@ -1482,10 +1493,7 @@ class AdaptiveFusion(nn.Module):
         else:
             local_context = torch.zeros_like(temporal_feat)
             local_weights = None
-            delta = torch.zeros_like(temporal_feat)
-            if time_steps > 1:
-                delta[:, 1:] = temporal_feat[:, 1:] - temporal_feat[:, :-1]
-            shock_score = (delta.square().mean(dim=-1) + 1e-8).sqrt()
+            shock_score = self._compute_shock_score(temporal_feat)
 
         global_expanded = global_context.unsqueeze(1).expand_as(temporal_feat)
         # shock_score 始终计算（用于 diagnostics），但仅在启用局部注意力时
@@ -1613,11 +1621,13 @@ class AdaptiveGatedResUnit(nn.Module):
         # 隐藏状态
         h_t = o_t * torch.tanh(c_t)
 
-        # 残差连接
+        # 残差连接：维度不匹配时用投影对齐；匹配时直接恒等
+        # 由于 __init__ 保证 input_dim != hidden_dim 时才创建 residual_proj，
+        # else 分支中 x.shape[-1] == hidden_dim 恒成立。
         if self.residual_proj is not None:
             residual = self.residual_proj(x)
         else:
-            residual = x if x.shape[-1] == self.hidden_dim else 0
+            residual = x
 
         h_t = h_t + residual  # 残差相加
         h_t = self.layer_norm(h_t)
@@ -1752,6 +1762,7 @@ class MultiScaleTemporalEncoder(nn.Module):
         self.max_steps = max_steps
         self.mode = mode
         self.output_dim = hidden_dim * 2
+        self.coarse_fallback = None  # 仅 legacy 模式使用，lightweight 设为 None
 
         if mode == 'legacy':
             self.fine_encoder = nn.LSTM(
@@ -2412,6 +2423,16 @@ class EarlyStopping:
             self.counter = 0
 
 
+def specificity_score(y_true, y_pred):
+    """计算 Specificity（真负率）= TN / (TN + FP)。
+
+    sklearn 未直接提供此指标，从 confusion matrix 手动计算。
+    """
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    denominator = tn + fp
+    return float(tn / denominator) if denominator else 0.0
+
+
 class Trainer:
     """
     AA-BiLSTM 模型训练器。
@@ -2576,14 +2597,13 @@ class Trainer:
 
     @staticmethod
     def _compute_class_counts(loader):
-        """从训练数据集读取全局类别数，不消耗随机 DataLoader。"""
-        labels = getattr(loader.dataset, 'labels', None)
-        if labels is None:
-            all_labels = []
-            for batch in loader:
-                all_labels.extend(batch['label'].cpu().numpy())
-            labels = np.asarray(all_labels)
-        elif torch.is_tensor(labels):
+        """从训练数据集读取全局类别数。
+
+        CreditDataset 始终暴露 .labels 属性，因此直接读取；
+        遍历 DataLoader 的分支为通用数据集兼容路径（CreditDataset 下不可达）。
+        """
+        labels = loader.dataset.labels
+        if torch.is_tensor(labels):
             labels = labels.cpu().numpy()
         counts = np.bincount(np.asarray(labels, dtype=np.int64), minlength=2)
         if len(counts) != 2 or np.any(counts == 0):
@@ -2825,6 +2845,7 @@ class Trainer:
         Returns:
             float: ECE 值
         """
+        labels = np.asarray(labels)
         probabilities = np.asarray(probabilities)
         edges = np.linspace(0.0, 1.0, n_bins + 1)
         # np.digitize 用 edges[1:-1] 作为分界点（去掉 0 和 1 两个端点），
@@ -3242,6 +3263,7 @@ class Trainer:
                 'objective': np.nan,
             }
 
+        # 按 objective 选最优；相同 objective 时按阈值接近 0.5 程度打破平局
         (
             objective,
             balanced_accuracy,
@@ -3251,7 +3273,7 @@ class Trainer:
             f1,
             _,
             threshold,
-        ) = max(scored)
+        ) = max(scored, key=lambda x: (x[0], x[6]))  # x[0]=objective, x[6]=-abs(th-0.5)
         return float(threshold), {
             'accuracy': float(accuracy),
             'f1': float(f1),
@@ -3351,7 +3373,7 @@ class Trainer:
                 self.calibration_scale,
                 self.calibration_bias,
                 operating_labels,
-                operating_probabilities,
+                raw_operating_probabilities,
                 calibration_metrics,
             ) = self.fit_platt_scaling()
         else:
@@ -3359,16 +3381,18 @@ class Trainer:
                 self._collect_logits(self.calibration_loader)
             )
             operating_labels = operating_label_tensor.numpy()
-            operating_margins = (
+            # 不校准时 margin 已经已知，无需后续从概率反推
+            operating_margin = (
                 operating_logits[:, 1] - operating_logits[:, 0]
             ).numpy()
-            operating_probabilities = self._apply_platt(
-                operating_margins,
+            raw_operating_probabilities = self._apply_platt(
+                operating_margin,
                 1.0,
                 0.0,
             )
             self.calibration_scale = 1.0
             self.calibration_bias = 0.0
+            operating_margin_from_probs = operating_margin
         self.temperature = 1.0 / max(self.calibration_scale, 1e-7)
 
         # 阈值搜索在原始 margin 概率空间进行（排序不变），
@@ -3377,7 +3401,7 @@ class Trainer:
         raw_decision_threshold, validation_threshold_metrics = self.find_best_threshold(
             min_sensitivity=self.threshold_min_sensitivity,
             labels=operating_labels,
-            probabilities=operating_probabilities,
+            probabilities=raw_operating_probabilities,
         )
         clipped_raw_threshold = float(np.clip(
             raw_decision_threshold,
@@ -3394,18 +3418,19 @@ class Trainer:
             self.calibration_scale,
             self.calibration_bias,
         )[0])
-        # 将操作集概率转为 margin（logit 空间），再做 Platt 校准，
-        # 得到校准后的概率分布，最后计算预测熵。
-        operating_margin = np.log(
-            np.clip(operating_probabilities, 1e-7, 1.0 - 1e-7)
-            / np.clip(
-                1.0 - operating_probabilities,
-                1e-7,
-                1.0,
+        # 校准路径：需要从原始概率反推 margin（logit 空间）用于 Platt 校准
+        # 非校准路径：margin 已在上方直接获取，无需重复计算
+        if self.calibrate_probabilities:
+            operating_margin_from_probs = np.log(
+                np.clip(raw_operating_probabilities, 1e-7, 1.0 - 1e-7)
+                / np.clip(
+                    1.0 - raw_operating_probabilities,
+                    1e-7,
+                    1.0,
+                )
             )
-        )
         calibrated_operating_probabilities = self._apply_platt(
-            operating_margin,
+            operating_margin_from_probs,
             self.calibration_scale,
             self.calibration_bias,
         )
@@ -3448,21 +3473,12 @@ class Trainer:
             f"{self.selection_metric}={best_score:.4f}"
         )
 
-        # The untouched test set is evaluated once with the validation cutoff.
+        # 用验证集确定的阈值在测试集上做一次最终评估
         test_metrics = self.evaluate(self.test_loader, threshold=self.decision_threshold)
-        test_metrics['validation_threshold_accuracy'] = validation_threshold_metrics['accuracy']
-        test_metrics['validation_threshold_sensitivity'] = validation_threshold_metrics['sensitivity']
-        test_metrics['validation_threshold_specificity'] = validation_threshold_metrics['specificity']
-        test_metrics['validation_threshold_objective'] = validation_threshold_metrics['objective']
-        test_metrics['operating_threshold_accuracy'] = (
-            validation_threshold_metrics['accuracy']
-        )
-        test_metrics['operating_threshold_sensitivity'] = (
-            validation_threshold_metrics['sensitivity']
-        )
-        test_metrics['operating_threshold_specificity'] = (
-            validation_threshold_metrics['specificity']
-        )
+        test_metrics['threshold_accuracy'] = validation_threshold_metrics['accuracy']
+        test_metrics['threshold_sensitivity'] = validation_threshold_metrics['sensitivity']
+        test_metrics['threshold_specificity'] = validation_threshold_metrics['specificity']
+        test_metrics['threshold_objective'] = validation_threshold_metrics['objective']
         test_metrics['threshold_sensitivity_lower_bound'] = validation_threshold_metrics[
             'sensitivity_lower_bound'
         ]
@@ -3484,18 +3500,12 @@ class Trainer:
         return test_metrics, self.history
 
 
-def specificity_score(y_true, y_pred):
-    """计算 Specificity（真负率）= TN / (TN + FP)。
-
-    sklearn 未直接提供此指标，从 confusion matrix 手动计算。
-    """
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-    denominator = tn + fp
-    return float(tn / denominator) if denominator else 0.0
-
-
 class SequenceBaselineModel(nn.Module):
     """序列基线模型：统一接口支持 LSTM / Bi-LSTM / Attention-LSTM / ResNet-LSTM。
+
+    注：Attention-LSTM 为单向；Bi-LSTM 和 ResNet-LSTM 均为双向。
+        ResNet-LSTM 残差连接建立在双向 LSTM 之上，
+        因此其表示能力天然包含双向信息。
 
     Args:
         static_dim: 静态特征维度
@@ -3581,16 +3591,29 @@ def train_sequence_baseline(name, model, X_static_train, X_temporal_train, y_tra
             optimizer.zero_grad()
             loss = criterion(model(static, temporal), labels)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # 梯度裁剪：error_if_nonfinite=False 避免 NaN 梯度导致整个实验崩溃
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0,
+                                          error_if_nonfinite=False)
             optimizer.step()
 
+    # 批量化评估，避免全量数据一次性加载到 GPU（Taiwan 30k 样本可能 OOM）
     model.eval()
+    test_dataset = CreditDataset(X_static_test, X_temporal_test, y_test)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size,
+                             pin_memory=torch.cuda.is_available())
+    all_probs = []
+    all_labels = []
     with torch.inference_mode():
-        static = torch.FloatTensor(X_static_test).to(device)
-        temporal = torch.FloatTensor(X_temporal_test).to(device)
-        labels = np.asarray(y_test)
-        probs = torch.softmax(model(static, temporal), dim=-1)[:, 1].cpu().numpy()
-        preds = (probs >= 0.5).astype(int)
+        for batch in test_loader:
+            static = batch['static'].to(device)
+            temporal = batch['temporal'].to(device)
+            labels_batch = batch['label']
+            probs_batch = torch.softmax(model(static, temporal), dim=-1)[:, 1].cpu().numpy()
+            all_probs.append(probs_batch)
+            all_labels.append(labels_batch.numpy())
+    probs = np.concatenate(all_probs)
+    labels = np.concatenate(all_labels)
+    preds = (probs >= 0.5).astype(int)
 
     try:
         auc = roc_auc_score(labels, probs)
@@ -3700,21 +3723,20 @@ class Explainer:
             temporal_data[sample_size:sample_size + explain_size]
         ).float().to(device)
 
-        # 过滤 SHAP 对 LayerNorm 的警告
-        warnings.filterwarnings(
-            'ignore',
-            message='.*unrecognized nn.Module.*',
-            category=UserWarning,
-        )
-
         try:
-            # 尝试使用 DeepExplainer
+            # 尝试使用 DeepExplainer；用 catch_warnings 局部抑制 SHAP 的 LayerNorm 警告
             print("Attempting SHAP DeepExplainer...")
-            explainer = self.shap.DeepExplainer(
-                wrapped_model,
-                [background_static, background_temporal],
-            )
-            shap_values = explainer.shap_values([test_sample_static, test_sample_temporal])
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    'ignore',
+                    message='.*unrecognized nn.Module.*',
+                    category=UserWarning,
+                )
+                explainer = self.shap.DeepExplainer(
+                    wrapped_model,
+                    [background_static, background_temporal],
+                )
+                shap_values = explainer.shap_values([test_sample_static, test_sample_temporal])
             print("SHAP DeepExplainer succeeded.")
             return shap_values, explainer
         except Exception as e:
@@ -3738,7 +3760,9 @@ class Explainer:
         background_flat = np.concatenate([static_flat, temporal_flat], axis=1)
 
         def model_predict(flat_input):
-            """KernelExplainer 的回调：展平输入 → 恢复三维 → 前向 → softmax 正类概率。"""
+            """KernelExplainer 回调：展平输入 → 恢复三维 → 前向 → softmax。
+            返回完整 (N, 2) 概率矩阵而非单列，确保 shap_values 与
+            DeepExplainer 的 per-class list 格式一致。"""
             n = flat_input.shape[0]
             static_dim = static_data.shape[1]
             temporal_dim_2d = temporal_data.shape[1]   # T
@@ -3752,7 +3776,7 @@ class Explainer:
             with torch.inference_mode():
                 output = wrapped_model([static_part, temporal_part])
                 probs = torch.softmax(output, dim=-1)
-            return probs[:, 1].cpu().numpy()
+            return probs.cpu().numpy()  # 返回 (N, 2)，与 DeepExplainer per-class 格式一致
 
         # 测试数据展平
         explain_size = min(50, len(static_data) - sample_size)
@@ -3766,14 +3790,19 @@ class Explainer:
             model_predict,
             background_flat[:100],
         )
-        shap_values = explainer.shap_values(test_flat, nsamples=100)
+        # shap_values: 返回 list of 2 arrays（每类一个），每个 (explain_size, total_features)
+        raw_shap = explainer.shap_values(test_flat, nsamples=100)
+        if isinstance(raw_shap, list):
+            # 堆叠为 (explain_size, total_features, 2)，与 DeepExplainer 输出对齐
+            raw_shap = np.stack(raw_shap, axis=-1)
 
-        # 重构 SHAP 值格式以匹配双输入
-        static_shap = shap_values[:, :static_data.shape[1]]
-        temporal_shap = shap_values[:, static_data.shape[1]:].reshape(
+        # 拆分静态/时序 SHAP 值，保留类别维度
+        static_shap = raw_shap[:, :static_data.shape[1], :]
+        temporal_shap = raw_shap[:, static_data.shape[1]:, :].reshape(
             explain_size,
             temporal_data.shape[1],
             temporal_data.shape[2],
+            -1,  # 类别维度
         )
 
         print("KernelExplainer succeeded.")
@@ -4661,7 +4690,8 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
                            dropout=dropout,
                            lr=lr,
                            weight_decay=weight_decay,
-                           enable_local_attention=enable_local_attention)
+                           enable_local_attention=enable_local_attention,
+                           enable_temporal_categorical=enable_local_attention)
 
     if run_analysis and dataset_name == 'taiwan':
         run_history_length_study(
@@ -4674,7 +4704,6 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
             hidden_dim=hidden_dim,
             num_layers=num_layers,
             dropout=dropout,
-            preprocessor_template=data_loader,
             split_seed=split_seed,
             # 不用外推的伪月份证明长期依赖；超过真实长度的实验直接跳过。
             extend_method=None
@@ -4706,7 +4735,8 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
             dropout=dropout,
             lr=lr,
             weight_decay=weight_decay,
-            enable_local_attention=enable_local_attention
+            enable_local_attention=enable_local_attention,
+            enable_temporal_categorical=enable_local_attention
         )
 
     if run_analysis:
@@ -4884,7 +4914,8 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
                        calibration_loader=None, epoch=30,
                        hidden_dim=64, num_layers=4, dropout=0.3,
                        lr=1e-3, weight_decay=1e-4,
-                       enable_local_attention=True):
+                       enable_local_attention=True,
+                       enable_temporal_categorical=True):
     """
     严格消融实验：逐一添加组件，量化每个模块对性能的增量贡献。
 
@@ -5028,7 +5059,7 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
             use_global_context=config['use_global'],
             use_local_attention=config['use_local'],
             temporal_categorical_index=(
-                0 if temporal_dim > 3 else None
+                0 if enable_temporal_categorical else None
             ),
             use_step_embedding=True,
             multiscale_mode='lightweight',
@@ -5140,7 +5171,8 @@ def run_imbalance_robustness_study(X_static_train, X_temporal_train, y_train,
                                    epoch=20, batch_size=128, hidden_dim=128,
                                    num_layers=8, dropout=0.4,
                                    lr=5e-4, weight_decay=2e-4,
-                                   enable_local_attention=True):
+                                   enable_local_attention=True,
+                                   enable_temporal_categorical=True):
     """
     类别不平衡鲁棒性实验：在不同训练集违约率下比较 Standard LSTM 与 AA-BiLSTM。
 
@@ -5245,7 +5277,7 @@ def run_imbalance_robustness_study(X_static_train, X_temporal_train, y_train,
             use_global_context=True,
             use_local_attention=enable_local_attention,
             temporal_categorical_index=(
-                0 if X_temporal_train.shape[2] > 3 else None
+                0 if enable_temporal_categorical else None
             ),
             use_step_embedding=True,
             multiscale_mode='lightweight',
@@ -5283,7 +5315,7 @@ def run_history_length_study(static_features, temporal_features, y, dataset_name
                              history_lengths=(3, 6, 12, 24, 36), epoch=30,
                              batch_size=128, hidden_dim=128, num_layers=8,
                              dropout=0.4, extend_method=None,
-                             preprocessor_template=None, split_seed=42):
+                             split_seed=42):
     """
     长期依赖能力验证。支持数据扩展以测试更长时间窗口。
 
@@ -5358,13 +5390,8 @@ def run_history_length_study(static_features, temporal_features, y, dataset_name
                 results[name].append({'history_length': length, 'auc': None, 'status': 'skipped'})
             continue
 
-        # 每种历史长度需要独立的 data_loader 实例；
-        # deepcopy 避免修改原始 preprocessor 的状态（如 scaler、split_indices_）
-        data_loader = (
-            copy.deepcopy(preprocessor_template)
-            if preprocessor_template is not None
-            else CreditDataLoader()
-        )
+        # preprocess() 内部会重新拟合 scaler 和 split，无需 deepcopy 模板
+        data_loader = CreditDataLoader()
         data_loader.temporal_step_names = [f'month_{i + 1}' for i in range(length)]
         data_loader.temporal_feature_names = ['feature_' + str(i) for i in range(temporal_features.shape[2])]
 
@@ -5876,6 +5903,7 @@ def attach_repeat_summary(primary_metrics, metric_rows):
 # 命令行入口：交互模式或参数模式
 # ============================================================
 if __name__ == '__main__':
+    set_seed(42)  # 模块导入时不设种子，仅在直接运行时设定
     args = parse_args()
 
     dataset_name = args.dataset
