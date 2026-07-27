@@ -22,10 +22,8 @@ from sklearn.metrics import (
     f1_score,
     fbeta_score,
     log_loss,
-    matthews_corrcoef,
     precision_score,
     recall_score,
-    roc_curve,
     roc_auc_score,
 )
 from sklearn.svm import SVC
@@ -80,9 +78,8 @@ warnings.filterwarnings(
 #      MultiScaleTemporalEncoder 多尺度时序编码器
 #   3. DynamicFocalLoss 动态焦点损失函数
 #   4. 训练器（含 Platt 概率校准、阈值搜索、EMA、混合精度）
-#   5. BlackSwanMonitor 分布外（OOD）监测器
-#   6. SHAP 可解释性分析
-#   7. 对比实验（传统 ML / 深度学习基线、消融实验、不平衡鲁棒性）
+#   5. SHAP 可解释性分析
+#   6. 对比实验（传统 ML / 深度学习基线、消融实验、不平衡鲁棒性）
 #
 # 运行入口：python final_essay.py --dataset german 或 --dataset taiwan
 # ============================================================
@@ -152,8 +149,6 @@ class CreditDataLoader:
         self.static_dummy_columns_ = None
         self.split_indices_ = None
         self.calibration_data_ = None
-        self.audit_groups = {}
-        self.audit_group_splits_ = {}
 
         # 原始静态字段会保留到数据切分之后；one-hot 词表只能用训练集拟合。
         self._raw_static_numeric = None
@@ -346,7 +341,6 @@ class CreditDataLoader:
         - 构建时序特征（6 个月 × 5 通道）：还款状态、有符号 log 账单金额、
           有符号 log 还款金额、账单利用率、还款占账单比
         - 时序方向统一为"最早月 → 最近月"
-        - 设置审计分组（性别、年龄段）用于公平性评估
 
         Args:
             filepath: 本地文件路径，为 None 时自动从 UCI 在线下载
@@ -392,8 +386,33 @@ class CreditDataLoader:
                 "Reading Taiwan .xls files requires xlrd >= 2.0.1. "
                 "Install xlrd, or use a .csv version of the Taiwan dataset."
             ) from e
-        except Exception as e:
-            raise RuntimeError(f"读取数据集失败: {filepath}\n原始错误: {e}") from e
+        except (OSError, Exception) as e:
+            # UCI 服务器 SSL 证书在某些环境（如 Python 3.12+）下不被信任；
+            # 回退到手动下载 + 宽松 SSL 模式
+            if is_url and ext in ['.xls', '.xlsx']:
+                try:
+                    import ssl
+                    import urllib.request
+                    import io
+
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    with urllib.request.urlopen(
+                        filepath, context=ctx, timeout=30
+                    ) as resp:
+                        raw_bytes = resp.read()
+                    df = pd.read_excel(io.BytesIO(raw_bytes), header=1)
+                except Exception as fallback_e:
+                    raise RuntimeError(
+                        f"无法读取数据集（直接读取与 SSL 回退均失败）。\n"
+                        f"直接读取错误: {e}\n"
+                        f"SSL 回退错误: {fallback_e}\n"
+                        "请手动下载数据集并通过 --data-path 指定本地路径。\n"
+                        f"下载地址: {TAIWAN_CREDIT_URL}"
+                    ) from fallback_e
+            else:
+                raise RuntimeError(f"读取数据集失败: {filepath}\n原始错误: {e}") from e
 
         # 清理列名
         df.columns = [str(c).strip() for c in df.columns]
@@ -501,14 +520,6 @@ class CreditDataLoader:
         )
         self._raw_static_categorical_names = list(static_cat_cols)
         self._raw_static_prefixes = list(static_cat_cols)
-        self.audit_groups = {
-            'sex': df['SEX'].astype(str).to_numpy(),
-            'age_band': pd.cut(
-                df['AGE'].astype(float),
-                bins=[-np.inf, 29, 39, 49, 59, np.inf],
-                labels=['<30', '30-39', '40-49', '50-59', '60+'],
-            ).astype(str).to_numpy(),
-        }
 
         static_df = pd.concat(
             [base_static_df.reset_index(drop=True), engineered_static.reset_index(drop=True)],
@@ -908,18 +919,6 @@ class CreditDataLoader:
         y_val = y[val_idx]
         y_calibration = y[calibration_idx]
         y_test = y[test_idx]
-        self.audit_group_splits_ = {
-            split: {
-                name: np.asarray(values)[indices]
-                for name, values in self.audit_groups.items()
-            }
-            for split, indices in (
-                ('train', train_idx),
-                ('validation', val_idx),
-                ('calibration', calibration_idx),
-                ('test', test_idx),
-            )
-        }
 
         # 区分 binary/continuous 列：one-hot 列值只有 0 和 1，
         # 不应被 StandardScaler 缩放（会破坏语义）；只对连续列做标准化。
@@ -1057,195 +1056,6 @@ class CreditDataset(Dataset):
             'temporal': self.temporal_features[idx],
             'label': self.labels[idx]
         }
-
-
-class BlackSwanMonitor:
-    """
-    与分类模型解耦的鲁棒分布外监测器。
-
-    监测器仅使用训练集拟合特征中位数和 MAD，并在全局状态、波动、趋势
-    与最大相邻突变描述符上计算异常分数。它不把未知样本强制归为违约，
-    而是为人工复核或保守策略提供 OOD 标记。
-    """
-
-    def __init__(self, quantile=0.99, top_fraction=0.10, eps=1e-6):
-        if not 0.5 < quantile < 1.0:
-            raise ValueError("quantile must be between 0.5 and 1.0.")
-        if not 0.0 < top_fraction <= 1.0:
-            raise ValueError("top_fraction must be in (0, 1].")
-        self.quantile = float(quantile)
-        self.top_fraction = float(top_fraction)
-        self.eps = float(eps)
-        self.center_ = None
-        self.scale_ = None
-        self.threshold_ = None
-
-    @staticmethod
-    def _descriptors(static_features, temporal_features):
-        """构建监测描述符矩阵。
-
-        对每个样本提取 8 组统计量作为 OOD 检测的输入：
-        - 静态特征（直接拼接）
-        - 时序均值、标准差、最大值、最小值（全局状态）
-        - 最后一个时间步的原始值（最近状态）
-        - 首尾差值（趋势）
-        - 相邻时间步的最大绝对差值（突变强度）
-
-        Args:
-            static_features: (N, S) 静态特征
-            temporal_features: (N, T, F) 时序特征
-
-        Returns:
-            (N, S + 7*F) 描述符矩阵
-        """
-        static_features = np.asarray(static_features, dtype=np.float32)
-        temporal_features = np.asarray(temporal_features, dtype=np.float32)
-        if static_features.ndim != 2:
-            raise ValueError("static_features must have shape [N, S].")
-        if temporal_features.ndim != 3:
-            raise ValueError("temporal_features must have shape [N, T, F].")
-        if static_features.shape[0] != temporal_features.shape[0]:
-            raise ValueError("Static and temporal sample counts must match.")
-
-        mean = temporal_features.mean(axis=1)
-        std = temporal_features.std(axis=1)
-        maximum = temporal_features.max(axis=1)
-        minimum = temporal_features.min(axis=1)
-        last = temporal_features[:, -1]
-        trend = temporal_features[:, -1] - temporal_features[:, 0]
-        if temporal_features.shape[1] > 1:
-            max_abs_delta = np.abs(
-                np.diff(temporal_features, axis=1)
-            ).max(axis=1)
-        else:
-            max_abs_delta = np.zeros_like(last)
-
-        return np.concatenate([
-            static_features,
-            mean,
-            std,
-            maximum,
-            minimum,
-            last,
-            trend,
-            max_abs_delta
-        ], axis=1)
-
-    def _raw_scores(self, descriptors):
-        """计算异常分数：top-k 平均 robust z-score。
-
-        对每个样本取其描述符各维度的 robust z-score 绝对值，
-        保留最大的 top_fraction 比例的维度取均值作为该样本的异常分数。
-        这样比全维度平均更能捕获少数维度上的极端偏离。
-
-        Args:
-            descriptors: (N, D) 描述符矩阵
-
-        Returns:
-            (N,) 异常分数向量
-        """
-        robust_z = np.abs(
-            (descriptors - self.center_) / self.scale_
-        )
-        top_k = max(
-            1,
-            int(np.ceil(robust_z.shape[1] * self.top_fraction))
-        )
-        # np.partition 做部分排序：第 (D - top_k) 个位置之后全是最大的 top_k 个值
-        # 复杂度 O(D) vs 完整排序 O(D log D)，在特征维度大时显著更快
-        partitioned = np.partition(
-            robust_z, robust_z.shape[1] - top_k, axis=1
-        )
-        return partitioned[:, -top_k:].mean(axis=1)  # top-k 维度的均值作为异常分数
-
-    def fit(self, static_features, temporal_features):
-        """用训练集拟合 OOD 监测器中心、尺度和阈值。
-
-        Args:
-            static_features: (N_train, S) 训练集静态特征
-            temporal_features: (N_train, T, F) 训练集时序特征
-        """
-        descriptors = self._descriptors(
-            static_features, temporal_features
-        )
-        self.center_ = np.median(descriptors, axis=0)
-        mad = np.median(
-            np.abs(descriptors - self.center_), axis=0
-        )
-        # 1.4826 = 1 / Φ^{-1}(3/4)，将 MAD 转换为正态分布标准差的一致估计
-        # 三级回退缩放估计：
-        # 1. 首选 MAD→robust_scale（对异常值鲁棒，但 MAD 可能为 0 于常数特征）
-        # 2. robust_scale≈0 → 退回到普通 std（有偏但对常数特征有效）
-        # 3. std≈0 → 退回到 1.0（常数特征不做缩放，仅靠中心化检测偏离）
-        robust_scale = 1.4826 * mad
-        fallback_scale = descriptors.std(axis=0)
-        self.scale_ = np.where(
-            robust_scale > self.eps,
-            robust_scale,
-            np.where(fallback_scale > self.eps, fallback_scale, 1.0)
-        )
-        train_scores = self._raw_scores(descriptors)
-        self.threshold_ = float(
-            np.quantile(train_scores, self.quantile)
-        )
-        return self
-
-    def score(self, static_features, temporal_features):
-        """计算新样本的 OOD 异常分数并标记异常。
-
-        Args:
-            static_features: (N, S) 静态特征
-            temporal_features: (N, T, F) 时序特征
-
-        Returns:
-            (scores, flags): scores 为 (N,) 异常分数，flags 为 (N,) bool 标记
-        """
-        if self.center_ is None or self.scale_ is None:
-            raise RuntimeError("BlackSwanMonitor must be fitted first.")
-        descriptors = self._descriptors(
-            static_features, temporal_features
-        )
-        scores = self._raw_scores(descriptors)
-        flags = scores > self.threshold_
-        return scores.astype(np.float32), flags
-
-    def calibrate_threshold(self, static_features, temporal_features):
-        """固定训练中心/尺度，仅用验证集校准 ID 假阳性分位点。"""
-        if self.center_ is None or self.scale_ is None:
-            raise RuntimeError("BlackSwanMonitor must be fitted first.")
-        descriptors = self._descriptors(
-            static_features,
-            temporal_features,
-        )
-        calibration_scores = self._raw_scores(descriptors)
-        self.threshold_ = float(
-            np.quantile(calibration_scores, self.quantile)
-        )
-        return self
-
-    def to_dict(self):
-        if self.center_ is None or self.scale_ is None:
-            raise RuntimeError("BlackSwanMonitor must be fitted first.")
-        return {
-            'quantile': self.quantile,
-            'top_fraction': self.top_fraction,
-            'eps': self.eps,
-            'center': self.center_.tolist(),
-            'scale': self.scale_.tolist(),
-            'threshold': self.threshold_
-        }
-
-    @classmethod
-    def from_dict(cls, state):
-        monitor = cls(
-            quantile=state['quantile'],
-            top_fraction=state['top_fraction'],
-            eps=state.get('eps', 1e-6)
-        )
-        monitor.center_ = np.asarray(state['center'], dtype=np.float32)
-        monitor.scale_ = np.asarray(state['scale'], dtype=np.float32)
-        monitor.threshold_ = float(state['threshold'])
-        return monitor
 
 
 # ==============================
@@ -2835,45 +2645,6 @@ class Trainer:
             'bias': float(bias),
         }
 
-    @staticmethod
-    def _expected_calibration_error(labels, probabilities, n_bins=15):
-        """计算 Expected Calibration Error（ECE，期望校准误差）。
-
-        将 [0,1] 等分为 n_bins 个 bin，每个 bin 内取预测概率均值与真实标签均值的
-        绝对差，按 bin 样本比例加权求和。ECE 越低，概率校准越好。
-
-        Args:
-            labels: (N,) 真实标签
-            probabilities: (N,) 预测概率
-            n_bins: 分箱数
-
-        Returns:
-            float: ECE 值
-        """
-        labels = np.asarray(labels)
-        probabilities = np.asarray(probabilities)
-        edges = np.linspace(0.0, 1.0, n_bins + 1)
-        # np.digitize 用 edges[1:-1] 作为分界点（去掉 0 和 1 两个端点），
-        # right=False 使概率值等于边界时归入右侧 bin；
-        # np.minimum(..., n_bins-1) 将概率=1.0 的样本归入最后一个 bin
-        bin_ids = np.minimum(
-            np.digitize(probabilities, edges[1:-1], right=False),
-            n_bins - 1,
-        )
-        result = 0.0
-        for bin_idx in range(n_bins):
-            mask = bin_ids == bin_idx
-            if not np.any(mask):
-                continue
-            result += (
-                float(mask.mean())
-                * abs(
-                    float(probabilities[mask].mean())
-                    - float(labels[mask].mean())
-                )
-            )
-        return float(result)
-
     def train_epoch(self, epoch):
         """训练一个 epoch：混合精度前向 → 反向 → 梯度裁剪 → 优化器步进 → EMA 更新。
 
@@ -2971,8 +2742,7 @@ class Trainer:
         """评估模型，返回排序、分类和概率校准指标的完整集合。
 
         计算指标包括：Accuracy, AUC-ROC, AUC-PR, F1, F2, Precision,
-        Sensitivity(Recall), Specificity, Balanced Accuracy, MCC, KS,
-        Lift@10%, LogLoss, Brier Score, ECE。
+        Sensitivity(Recall), Specificity, Balanced Accuracy, Brier Score。
 
         Args:
             loader: 评估数据加载器
@@ -3034,12 +2804,8 @@ class Trainer:
         accuracy = accuracy_score(flat_labels, flat_preds)
         try:
             auc = roc_auc_score(flat_labels, flat_probs)
-            fpr, tpr, _ = roc_curve(flat_labels, flat_probs)
-            # KS = max(TPR - FPR)：衡量模型区分为正负两类的能力
-            ks = float(np.max(tpr - fpr))
         except ValueError:
             auc = np.nan
-            ks = np.nan
         try:
             auc_pr = average_precision_score(flat_labels, flat_probs)
         except ValueError:
@@ -3066,23 +2832,7 @@ class Trainer:
             flat_labels,
             flat_preds,
         )
-        mcc = matthews_corrcoef(flat_labels, flat_preds)
-        probability_log_loss = log_loss(
-            flat_labels,
-            np.column_stack([1.0 - clipped_probs, clipped_probs]),
-            labels=[0, 1],
-        )
         brier = brier_score_loss(flat_labels, clipped_probs)
-        ece = self._expected_calibration_error(
-            flat_labels,
-            clipped_probs,
-        )
-        # Lift@10%：预测概率最高的前 10% 样本中违约率 / 整体违约率
-        # 值 > 1 表示模型能有效将高风险样本排到前列
-        top_count = max(1, int(np.ceil(len(flat_labels) * 0.10)))
-        top_indices = np.argsort(flat_probs)[-top_count:]
-        base_rate = max(float(np.mean(flat_labels)), 1e-12)  # 防除零
-        lift_at_10 = float(np.mean(flat_labels[top_indices]) / base_rate)
 
         return {
             'accuracy': float(accuracy),
@@ -3094,12 +2844,7 @@ class Trainer:
             'sensitivity': float(sensitivity),
             'specificity': float(specificity),
             'balanced_accuracy': float(balanced_accuracy),
-            'mcc': float(mcc),
-            'ks': float(ks),
-            'lift_at_10': float(lift_at_10),
-            'log_loss': float(probability_log_loss),
             'brier_score': float(brier),
-            'ece': float(ece),
             'temperature': float(
                 1.0 / max(calibration_scale, 1e-7)
             ),
@@ -3955,195 +3700,6 @@ def run_shap_summary(model, data_loader, X_static_test, X_temporal_test, dataset
     return shap_values
 
 
-def summarize_fusion_diagnostics(model, data_loader, X_static_test,
-                                 X_temporal_test, sample_size=256):
-    """汇总 AdaptiveFusion 的诊断信息：全局门、局部门、局部窗口注意力权重、时间步突变强度。
-
-    Args:
-        model: 训练好的 AABiLSTM 模型
-        data_loader: 含时序步/特征名的 CreditDataLoader
-        X_static_test/X_temporal_test: 评估数据
-        sample_size: 采样子集大小
-
-    Returns:
-        dict: 含 local_attention_by_lag / local_gate_mean / global_gate_mean /
-              mean_shock_by_step 等诊断指标
-    """
-    if not hasattr(model, 'forward'):
-        return None
-
-    n_samples = min(sample_size, len(X_static_test))
-    if n_samples <= 0:
-        return None
-
-    model.eval()
-    try:
-        with torch.inference_mode():
-            static = torch.FloatTensor(X_static_test[:n_samples]).to(device)
-            temporal = torch.FloatTensor(X_temporal_test[:n_samples]).to(device)
-            _, diagnostics = model(static, temporal, return_attention=True)
-    except Exception as e:
-        print(f"Fusion diagnostics skipped: {e}")
-        return None
-
-    if diagnostics is None:
-        print("Fusion diagnostics skipped: model returned no diagnostics.")
-        return None
-
-    result = {}
-    local_attention = diagnostics.get('local_attention')
-    if local_attention is not None:
-        weights = local_attention.detach().cpu().numpy()
-        mean_by_lag = weights.mean(axis=(0, 1))
-        window_size = len(mean_by_lag)
-        lag_names = [
-            f't-{window_size - 1 - idx}'
-            if idx < window_size - 1 else 'current'
-            for idx in range(window_size)
-        ]
-        print("\nMean local shock-attention weight by lag:")
-        for name, value in zip(lag_names, mean_by_lag):
-            print(f"{name:>8s}: {value:.6f}")
-        result['local_attention_by_lag'] = mean_by_lag
-
-    for key, label in (
-        ('local_gate', 'Local gate'),
-        ('global_gate', 'Global gate')
-    ):
-        value = diagnostics.get(key)
-        if value is not None:
-            mean_value = float(value.mean().item())
-            print(f"{label} mean activation: {mean_value:.6f}")
-            result[f'{key}_mean'] = mean_value
-
-    shock_score = diagnostics.get('shock_score')
-    if shock_score is not None:
-        mean_shock = shock_score.mean(dim=0).detach().cpu().numpy()
-        names = data_loader.temporal_step_names or [
-            f't{i}' for i in range(len(mean_shock))
-        ]
-        top_idx = np.argsort(mean_shock)[::-1][
-            :min(5, len(mean_shock))
-        ]
-        print("Top average temporal shock positions:")
-        for idx in top_idx:
-            print(f"{names[idx]}: {mean_shock[idx]:.6f}")
-        result['mean_shock_by_step'] = mean_shock
-
-    return result
-
-
-def summarize_selective_risk(labels, predictions, ood_scores, ood_flags):
-    """计算选择性风险（Selective Risk）：据 OOD 标记拒判后的覆盖率与精度。
-
-    当模型对某些样本发出 OOD 标记时，可选择拒判（不信任模型输出）。
-    本函数计算接受集（未被 OOD 标记）的覆盖率、准确率和召回率，
-    以及风险-覆盖曲线下面积（RC-AUC）。
-
-    Args:
-        labels: (N,) 真实标签
-        predictions: (N,) 模型预测
-        ood_scores: (N,) OOD 异常分数
-        ood_flags: (N,) bool OOD 标记
-
-    Returns:
-        dict: selective_coverage / selective_risk / selective_accuracy /
-              selective_sensitivity / risk_coverage_auc
-    """
-    labels = np.asarray(labels)
-    predictions = np.asarray(predictions)
-    scores = np.asarray(ood_scores)
-    flags = np.asarray(ood_flags, dtype=bool)
-    accepted = ~flags
-    errors = (predictions != labels).astype(np.float64)
-    # RC 曲线（Risk-Coverage）：按 OOD 分数从小到大逐步纳入样本，
-    # 累计错误率越低说明 OOD 分数与预测质量的相关性越强。
-    # RC-AUC = 累计风险曲线下面积，值越小越好。
-    order = np.argsort(scores)
-    cumulative_risk = (
-        np.cumsum(errors[order])
-        / np.arange(1, len(errors) + 1)  # 除以前缀长度得到累积错误率
-    )
-    result = {
-        'selective_coverage': float(accepted.mean()),
-        'selective_risk': (
-            float(errors[accepted].mean()) if np.any(accepted) else np.nan
-        ),
-        'risk_coverage_auc': float(cumulative_risk.mean()),
-    }
-    if np.any(accepted):
-        result['selective_accuracy'] = float(
-            accuracy_score(labels[accepted], predictions[accepted])
-        )
-        result['selective_sensitivity'] = float(
-            recall_score(
-                labels[accepted],
-                predictions[accepted],
-                zero_division=0,
-            )
-        )
-    else:
-        result['selective_accuracy'] = np.nan
-        result['selective_sensitivity'] = np.nan
-    return result
-
-
-def summarize_group_fairness(labels, predictions, groups, min_group_size=20):
-    """按人口统计分组输出审计用途的组间 TPR/FPR/Accuracy 差异。
-
-    对每个分组属性（如性别、年龄段），计算各组内的 Accuracy、TPR（召回率）、
-    FPR 和正向预测率，以及组间的最大-最小差距（gap）。
-    该分析仅用于审计，不参与模型训练。
-
-    Args:
-        labels: (N,) 真实标签
-        predictions: (N,) 模型预测
-        groups: {group_name: (N,) group_values} 分组字典
-        min_group_size: 组内最小样本数（低于此数的组不输出）
-
-    Returns:
-        (summaries, scalar_gaps):
-        - summaries: {group_name: {value: {n, accuracy, tpr, fpr, ...}}}
-        - scalar_gaps: {group_name_metric_gap: float} 各指标的组间最大差距
-    """
-    labels = np.asarray(labels)
-    predictions = np.asarray(predictions)
-    summaries = {}
-    scalar_gaps = {}
-    for group_name, group_values in (groups or {}).items():
-        group_values = np.asarray(group_values)
-        rows = {}
-        for value in np.unique(group_values):
-            mask = group_values == value
-            if int(mask.sum()) < min_group_size:
-                continue
-            tn, fp, fn, tp = confusion_matrix(
-                labels[mask],
-                predictions[mask],
-                labels=[0, 1],
-            ).ravel()
-            rows[str(value)] = {
-                'n': int(mask.sum()),
-                'accuracy': float(
-                    accuracy_score(labels[mask], predictions[mask])
-                ),
-                'tpr': float(tp / max(tp + fn, 1)),
-                'fpr': float(fp / max(fp + tn, 1)),
-                'positive_prediction_rate': float(
-                    predictions[mask].mean()
-                ),
-            }
-        if len(rows) < 2:
-            continue
-        summaries[group_name] = rows
-        for metric in ('accuracy', 'tpr', 'fpr', 'positive_prediction_rate'):
-            values = [row[metric] for row in rows.values()]
-            scalar_gaps[f'{group_name}_{metric}_gap'] = float(
-                max(values) - min(values)
-            )
-    return summaries, scalar_gaps
-
-
 def bootstrap_metric_intervals(
     labels,
     predictions,
@@ -4223,7 +3779,7 @@ def bootstrap_metric_intervals(
 
 def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path=None,
                    run_analysis=True, make_plots=True,
-                   threshold_min_sensitivity=None, ood_quantile=0.99,
+                   threshold_min_sensitivity=None,
                    seed=None,
                    split_seed=42,
                    hidden_dim=None, num_layers=None,
@@ -4243,12 +3799,11 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
 
     实验流水线：
     1. 加载数据集并做四层分割
-    2. 拟合 BlackSwanMonitor（OOD 监测）
-    3. 初始化 AA-BiLSTM 模型
-    4. 训练（含 auto-tune 可选超参搜索）
-    5. 测试集评估 + OOD 选择性风险 + 公平性审计 + Bootstrap CI
-    6. 可选：baselines 对比、消融实验、不平衡鲁棒性
-    7. 可选：SHAP 解释 + 融合模块诊断 + 训练历史可视化
+    2. 初始化 AA-BiLSTM 模型
+    3. 训练（含 auto-tune 可选超参搜索）
+    4. 测试集评估 + Bootstrap CI
+    5. 可选：baselines 对比、消融实验、不平衡鲁棒性
+    6. 可选：SHAP 解释 + 训练历史可视化
 
     Args:
         dataset_name: 'german' 或 'taiwan'
@@ -4258,7 +3813,6 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
         run_analysis: 是否运行额外分析（baselines + 消融 + 鲁棒性 + SHAP）
         make_plots: 是否生成训练曲线和混淆矩阵图
         threshold_min_sensitivity: 阈值搜索的敏感性下限
-        ood_quantile: OOD 监测器的分位阈值
         seed: 模型随机种子
         split_seed: 数据分割随机种子
         hidden_dim: 隐藏维度（None 时使用数据集默认值）
@@ -4382,18 +3936,7 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
         y_calibration,
     ) = data_loader.calibration_data_
 
-    # 只用训练集拟合鲁棒分布边界，避免验证/测试信息泄漏。
-    black_swan_monitor = BlackSwanMonitor(
-        quantile=ood_quantile
-    ).fit(
-        X_static_train,
-        X_temporal_train,
-    ).calibrate_threshold(
-        X_static_calibration,
-        X_temporal_calibration,
-    )
-
-    # 3. 创建 DataLoader
+    # 2. 创建 DataLoader
     train_dataset = CreditDataset(X_static_train, X_temporal_train, y_train)
     val_dataset = CreditDataset(X_static_val, X_temporal_val, y_val)
     calibration_dataset = CreditDataset(
@@ -4440,7 +3983,7 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
         persistent_workers=eval_workers > 0,
     )
 
-    # 4. 模型初始化
+    # 3. 模型初始化
     static_dim = X_static_train.shape[1]
     temporal_steps = X_temporal_train.shape[1]
     temporal_dim = X_temporal_train.shape[2]
@@ -4578,7 +4121,7 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
         f"({fusion_parameters / max(total_parameters, 1):.2%})"
     )
 
-    # 5. 训练
+    # 4. 训练
     trainer = Trainer(
         model, train_loader, val_loader, test_loader,
         calibration_loader=calibration_loader,
@@ -4601,9 +4144,6 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
 
     test_metrics, history = trainer.train()
 
-    ood_scores, ood_flags = black_swan_monitor.score(
-        X_static_test, X_temporal_test
-    )
     test_metrics.update({
         'seed': int(seed),
         'split_seed': int(split_seed),
@@ -4614,27 +4154,7 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
         'learning_rate': float(lr),
         'batch_size': int(batch_size),
         'loss_name': loss_name,
-        'ood_rate': float(ood_flags.mean()),
-        'in_distribution_coverage': float(1.0 - ood_flags.mean()),
-        'ood_score_mean': float(ood_scores.mean()),
-        'ood_score_max': float(ood_scores.max()),
-        'ood_threshold': float(black_swan_monitor.threshold_),
-        'ood_scores': ood_scores,
-        'ood_flags': ood_flags
     })
-    test_metrics.update(summarize_selective_risk(
-        test_metrics['labels'],
-        test_metrics['predictions'],
-        ood_scores,
-        ood_flags,
-    ))
-    fairness_detail, fairness_gaps = summarize_group_fairness(
-        test_metrics['labels'],
-        test_metrics['predictions'],
-        data_loader.audit_group_splits_.get('test', {}),
-    )
-    test_metrics['fairness_detail'] = fairness_detail
-    test_metrics.update(fairness_gaps)
     test_metrics.update(bootstrap_metric_intervals(
         test_metrics['labels'],
         test_metrics['predictions'],
@@ -4642,8 +4162,7 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
         random_state=split_seed,
     ))
     # 将部署所需的辅助状态绑定到模型上，方便同一进程内进行推理。
-    # CLI 可通过 --bundle / --checkpoint / --monitor-json 分别保存。
-    model.black_swan_monitor = black_swan_monitor
+    # CLI 可通过 --bundle / --checkpoint 分别保存。
     model.preprocessing_state = data_loader.export_preprocessing_state()
     model.training_config = {
         'dataset': dataset_name,
@@ -4673,35 +4192,20 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
         },
     }
 
-    # 6. 结果输出
+    # 5. 结果输出
     print(f"\n{'=' * 60}")
     print("FINAL TEST RESULTS")
     print(f"{'=' * 60}")
-    print(f"Accuracy:  {test_metrics['accuracy']:.4f} ({test_metrics['accuracy'] * 100:.2f}%)")
-    print(f"AUC-ROC:   {test_metrics['auc']:.4f}")
-    print(f"AUC-PR:    {test_metrics['auc_pr']:.4f}")
-    print(f"F1-Score:  {test_metrics['f1']:.4f}")
-    print(f"Precision: {test_metrics['precision']:.4f}")
     print(f"Sensitivity (Recall): {test_metrics['sensitivity']:.4f} ({test_metrics['sensitivity'] * 100:.2f}%)")
-    print(f"Specificity: {test_metrics['specificity']:.4f}")
-    print(f"Balanced Accuracy: {test_metrics['balanced_accuracy']:.4f}")
-    print(f"F2-Score:   {test_metrics['f2']:.4f}")
-    print(f"KS:         {test_metrics['ks']:.4f}")
-    print(f"Lift@10%:   {test_metrics['lift_at_10']:.3f}")
-    print(
-        f"Calibration: Brier={test_metrics['brier_score']:.4f} | "
-        f"ECE={test_metrics['ece']:.4f} | "
-        f"LogLoss={test_metrics['log_loss']:.4f}"
-    )
-    print(f"Decision Threshold: {test_metrics['threshold']:.3f}")
-    print(
-        f"OOD/Black-swan flags: {test_metrics['ood_rate']:.2%} | "
-        f"threshold={test_metrics['ood_threshold']:.3f}"
-    )
-    print(
-        f"Accepted-set Accuracy: {test_metrics['selective_accuracy']:.4f} | "
-        f"coverage={test_metrics['selective_coverage']:.2%}"
-    )
+    print(f"Precision:            {test_metrics['precision']:.4f}")
+    print(f"Specificity:          {test_metrics['specificity']:.4f}")
+    print(f"Accuracy:             {test_metrics['accuracy']:.4f} ({test_metrics['accuracy'] * 100:.2f}%)")
+    print(f"F1-Score:             {test_metrics['f1']:.4f}")
+    print(f"F2-Score:             {test_metrics['f2']:.4f}")
+    print(f"AUC-ROC:              {test_metrics['auc']:.4f}")
+    print(f"AUC-PR:               {test_metrics['auc_pr']:.4f}")
+    print(f"Brier Score:          {test_metrics['brier_score']:.4f}")
+    print(f"Decision Threshold:   {test_metrics['threshold']:.3f}")
     print(
         "95% bootstrap CI | "
         f"Accuracy [{test_metrics['accuracy_ci95_low']:.4f}, "
@@ -4723,7 +4227,7 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
     analysis_loader = test_loader if analysis_on_test else val_loader
     analysis_split_name = 'test' if analysis_on_test else 'validation'
 
-    # 7. 对比基准模型
+    # 6. 对比基准模型
     if run_analysis:
         print(
             f"Comparison with baseline models on {analysis_split_name} split..."
@@ -4734,7 +4238,7 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
                           deep_epochs=min(epoch, 30),
                           batch_size=batch_size)
 
-    # 8. 消融实验
+    # 7. 消融实验
     if run_analysis:
         print("\nRunning ablation study...")
         run_ablation_study(static_dim, temporal_dim, temporal_steps,
@@ -4793,14 +4297,7 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
             analysis_temporal_eval,
             dataset_name,
         )
-        summarize_fusion_diagnostics(
-            model,
-            data_loader,
-            analysis_static_eval,
-            analysis_temporal_eval,
-        )
-
-    # 9. 可视化训练历史
+    # 8. 可视化训练历史
     if make_plots:
         plot_training_history(history, dataset_name)
 
@@ -5462,21 +4959,18 @@ def save_experiment_bundle(path, model, metrics=None):
     bundle 包含：
     - 模型配置与权重（state_dict）
     - 决策阈值、温度、校准参数
-    - BlackSwanMonitor 状态
     - 预处理状态（特征名/缩放器/类别映射）
     - 训练配置与评估指标标量值
-    - 公平性审计详情
 
     Args:
         path: 保存路径
         model: 训练好的 AABiLSTM（需附加 model_config / preprocessing_state /
-               training_config / black_swan_monitor 等属性）
+               training_config 等属性）
         metrics: 评估指标字典（可选）
 
     Returns:
         bundle: 被保存的完整字典
     """
-    monitor = getattr(model, 'black_swan_monitor', None)
     bundle = {
         'format_version': 3,
         'model_class': 'AABiLSTM',
@@ -5500,11 +4994,6 @@ def save_experiment_bundle(path, model, metrics=None):
         'entropy_threshold': float(
             getattr(model, 'entropy_threshold', 0.65)
         ),
-        'black_swan_monitor': (
-            monitor.to_dict()
-            if monitor is not None and monitor.center_ is not None
-            else None
-        ),
         'preprocessing_state': copy.deepcopy(
             getattr(model, 'preprocessing_state', None)
         ),
@@ -5512,9 +5001,6 @@ def save_experiment_bundle(path, model, metrics=None):
             getattr(model, 'training_config', None)
         ),
         'metrics': scalar_metrics(metrics or {}),
-        'fairness_detail': copy.deepcopy(
-            (metrics or {}).get('fairness_detail')
-        ),
     }
     if not bundle['model_config']:
         raise ValueError("model.model_config is required for bundle export.")
@@ -5643,12 +5129,6 @@ def parse_args():
         default=None,
         help='Override EMA decay (default: 0.99 German / 0.995 Taiwan).',
     )
-    parser.add_argument(
-        '--ood-quantile',
-        type=float,
-        default=0.99,
-        help='Training-score quantile used as the black-swan/OOD threshold.'
-    )
     parser.add_argument('--result-json', default=None,
                         help='Optional path for test metrics and audit summary.')
     parser.add_argument('--checkpoint', default=None,
@@ -5657,11 +5137,6 @@ def parse_args():
         '--bundle',
         default=None,
         help='Optional path for a complete deployable experiment bundle.',
-    )
-    parser.add_argument(
-        '--monitor-json',
-        default=None,
-        help='Optional path for the fitted black-swan monitor state.'
     )
     analysis_group = parser.add_mutually_exclusive_group()
     analysis_group.add_argument(
@@ -5719,7 +5194,7 @@ def parse_args():
 
 
 def scalar_metrics(metrics):
-    """从指标字典中提取可序列化的标量值，排除大数组（predictions/probabilities/labels/ood_*）。
+    """从指标字典中提取可序列化的标量值，排除大数组（predictions/probabilities/labels）。
 
     Args:
         metrics: 完整的评估指标字典
@@ -5729,10 +5204,7 @@ def scalar_metrics(metrics):
     """
     result = {}
     for key, value in metrics.items():
-        if key in {
-            'predictions', 'probabilities', 'labels',
-            'ood_scores', 'ood_flags'
-        }:
+        if key in {'predictions', 'probabilities', 'labels'}:
             continue
         if isinstance(value, (np.floating, np.integer)):
             value = value.item()
@@ -5847,7 +5319,6 @@ if __name__ == '__main__':
         run_analysis=run_analysis,
         make_plots=make_plots,
         threshold_min_sensitivity=args.min_sensitivity,
-        ood_quantile=args.ood_quantile,
         seed=args.seed,
         split_seed=args.split_seed,
         hidden_dim=args.hidden_dim,
@@ -5911,8 +5382,6 @@ if __name__ == '__main__':
         result_dir = os.path.dirname(os.path.abspath(args.result_json))
         os.makedirs(result_dir, exist_ok=True)
         result_payload = scalar_metrics(metrics)
-        if metrics.get('fairness_detail'):
-            result_payload['fairness_detail'] = metrics['fairness_detail']
         with open(args.result_json, 'w', encoding='utf-8') as result_file:
             json.dump(
                 result_payload,
@@ -5931,18 +5400,6 @@ if __name__ == '__main__':
     if args.bundle:
         save_experiment_bundle(args.bundle, model, metrics)
         print(f"Saved complete experiment bundle to {args.bundle}")
-
-    if args.monitor_json:
-        monitor_dir = os.path.dirname(os.path.abspath(args.monitor_json))
-        os.makedirs(monitor_dir, exist_ok=True)
-        with open(args.monitor_json, 'w', encoding='utf-8') as monitor_file:
-            json.dump(
-                model.black_swan_monitor.to_dict(),
-                monitor_file,
-                ensure_ascii=False,
-                indent=2
-            )
-        print(f"Saved black-swan monitor to {args.monitor_json}")
 
     print("\nExperiment completed successfully!")
     print(f"Final Accuracy: {metrics['accuracy']:.4f}")
