@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression  # Platt calibration
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import StandardScaler
@@ -26,8 +26,6 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from sklearn.svm import SVC
-from sklearn.neural_network import MLPClassifier
 import matplotlib.pyplot as plt
 import seaborn as sns
 from collections import Counter
@@ -61,7 +59,6 @@ warnings.filterwarnings(
     message='.*Figures are typically created.*',
     category=UserWarning,
 )
-# SVC 在未收敛时也会产生 ConvergenceWarning，但 baseline 对比中用 try/except 包裹
 warnings.filterwarnings(
     'ignore',
     message='.*Solver terminated early.*',
@@ -4256,7 +4253,14 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
                                'lightweight' if dataset_name == 'taiwan' else 'legacy'
                            ),
                            use_step_embedding=(dataset_name == 'taiwan'),
-                           threshold_confidence=threshold_confidence)
+                           threshold_confidence=threshold_confidence,
+                           threshold_min_sensitivity=threshold_min_sensitivity,
+                           selection_metric=selection_metric,
+                           threshold_objective=threshold_objective,
+                           class_balance_power=class_balance_power,
+                           focal_gamma_max=focal_gamma_max,
+                           ema_decay=ema_decay,
+                           calibrate_probabilities=calibrate_probabilities)
 
 
     if run_analysis:
@@ -4286,7 +4290,14 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
                 'lightweight' if dataset_name == 'taiwan' else 'legacy'
             ),
             use_step_embedding=(dataset_name == 'taiwan'),
-            threshold_confidence=threshold_confidence
+            threshold_confidence=threshold_confidence,
+            threshold_min_sensitivity=threshold_min_sensitivity,
+            selection_metric=selection_metric,
+            threshold_objective=threshold_objective,
+            class_balance_power=class_balance_power,
+            focal_gamma_max=focal_gamma_max,
+            ema_decay=ema_decay,
+            calibrate_probabilities=calibrate_probabilities
         )
 
     if run_analysis:
@@ -4311,11 +4322,10 @@ def compare_baselines(X_static_train, X_temporal_train, y_train,
     与传统 ML 和深度序列基线模型进行全面对比。
 
     传统模型（展平时序 → 单表输入）：
-    - Logistic Regression, Random Forest, SVM, DNN (MLP)
-    - XGBoost, LightGBM（可选）
+    - Random Forest、XGBoost
 
     深度序列模型（保留时序结构）：
-    - Standard LSTM, Bi-LSTM, Attention-LSTM, ResNet-LSTM
+    - Standard LSTM、Bi-LSTM、Attention-LSTM
 
     Args:
         X_static_train/X_temporal_train/y_train: 训练数据
@@ -4347,13 +4357,7 @@ def compare_baselines(X_static_train, X_temporal_train, y_train,
     )
 
     models = {
-        'Logistic Regression': LogisticRegression(max_iter=2000, class_weight='balanced', random_state=42),
         'Random Forest': RandomForestClassifier(n_estimators=100, class_weight='balanced', random_state=42),
-        'SVM': SVC(C=1.0, kernel='rbf', probability=True, class_weight='balanced',
-                  max_iter=2000, tol=1e-3),
-        'DNN': MLPClassifier(hidden_layer_sizes=(128, 64), activation='relu',
-                             alpha=1e-4, max_iter=500, early_stopping=True,
-                             n_iter_no_change=15, random_state=42)
     }
 
     try:
@@ -4370,35 +4374,10 @@ def compare_baselines(X_static_train, X_temporal_train, y_train,
     except Exception as e:
         print(f"XGBoost skipped: {e}")
 
-    try:
-        from lightgbm import LGBMClassifier
-        models['LightGBM'] = LGBMClassifier(
-            n_estimators=200,
-            learning_rate=0.05,
-            class_weight='balanced',
-            random_state=42
-        )
-    except Exception as e:
-        print(f"LightGBM skipped: {e}")
-
     results = {}
     for name, model in models.items():
         try:
-            # SVC(RBF)复杂度 O(n²)，大数据集需子采样防卡死
-            if name == 'SVM' and len(X_train_flat) > 5000:
-                rng = np.random.default_rng(42)
-                svm_idx = rng.choice(
-                    len(X_train_flat),
-                    size=5000,
-                    replace=False,
-                )
-                svm_train_X = X_train_flat.iloc[svm_idx]
-                svm_train_y = y_train[svm_idx]
-                print(f"SVM: subsampled training from {len(X_train_flat)} to 5000.")
-            else:
-                svm_train_X = X_train_flat
-                svm_train_y = y_train
-            model.fit(svm_train_X, svm_train_y)
+            model.fit(X_train_flat, y_train)
             preds = model.predict(X_test_flat)
             probs = model.predict_proba(X_test_flat)[:, 1]
             try:
@@ -4433,7 +4412,6 @@ def compare_baselines(X_static_train, X_temporal_train, y_train,
         'Standard LSTM': 'lstm',
         'Bi-LSTM': 'bilstm',
         'Attention-LSTM': 'attention_lstm',
-        'ResNet-LSTM': 'resnet_lstm'
     }
     for name, model_type in deep_models.items():
         try:
@@ -4477,7 +4455,14 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
                        enable_temporal_categorical=True,
                        multiscale_mode='lightweight',
                        use_step_embedding=True,
-                       threshold_confidence=0.80):
+                       threshold_confidence=0.80,
+                       threshold_min_sensitivity=0.40,
+                       selection_metric='auc_pr',
+                       threshold_objective='hybrid',
+                       class_balance_power=0.5,
+                       focal_gamma_max=2.0,
+                       ema_decay=0.995,
+                       calibrate_probabilities=True):
     """
     消融实验：按方法论模块逐一添加，量化各模块对性能的增量贡献。
 
@@ -4605,6 +4590,13 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
             weight_decay=weight_decay,
             use_dynamic_focal=config['use_focal'],
             use_early_stopping=True,
+            threshold_min_sensitivity=threshold_min_sensitivity,
+            selection_metric=selection_metric,
+            threshold_objective=threshold_objective,
+            class_balance_power=class_balance_power,
+            focal_gamma_max=focal_gamma_max,
+            ema_decay=ema_decay,
+            calibrate_probabilities=calibrate_probabilities,
             threshold_confidence=threshold_confidence,
         )
 
@@ -4708,7 +4700,14 @@ def run_imbalance_robustness_study(X_static_train, X_temporal_train, y_train,
                                    enable_temporal_categorical=True,
                                    multiscale_mode='lightweight',
                                    use_step_embedding=True,
-                                   threshold_confidence=0.80):
+                                   threshold_confidence=0.80,
+                                   threshold_min_sensitivity=0.40,
+                                   selection_metric='auc_pr',
+                                   threshold_objective='hybrid',
+                                   class_balance_power=0.5,
+                                   focal_gamma_max=2.0,
+                                   ema_decay=0.995,
+                                   calibrate_probabilities=True):
     """
     类别不平衡鲁棒性实验：在不同训练集违约率下比较 Standard LSTM 与 AA-BiLSTM。
 
@@ -4833,6 +4832,13 @@ def run_imbalance_robustness_study(X_static_train, X_temporal_train, y_train,
             weight_decay=weight_decay,
             use_dynamic_focal=True,
             use_early_stopping=True,
+            threshold_min_sensitivity=threshold_min_sensitivity,
+            selection_metric=selection_metric,
+            threshold_objective=threshold_objective,
+            class_balance_power=class_balance_power,
+            focal_gamma_max=focal_gamma_max,
+            ema_decay=ema_decay,
+            calibrate_probabilities=calibrate_probabilities,
             threshold_confidence=threshold_confidence,
         )
         aa_metrics, _ = trainer.train()
