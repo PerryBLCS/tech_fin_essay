@@ -4479,17 +4479,14 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
                        use_step_embedding=True,
                        threshold_confidence=0.80):
     """
-    严格消融实验：逐一添加组件，量化每个模块对性能的增量贡献。
+    消融实验：按方法论模块逐一添加，量化各模块对性能的增量贡献。
 
     消融顺序（渐进累积）：
     1. Standard LSTM（基线，无任何增强）
-    2. + MultiScale only（仅多尺度编码）
-    3. Legacy CrossAttn（旧版交叉注意力 + 多尺度，同时开启全局+局部）
-    4. + Nonlinear Global（仅保留非线性全局聚合）
-    5. + Local Shock Attn（加入局部冲击注意力）
-    6. + AG-ResUnit（替换标准 LSTM 为 AG-ResUnit）
-    7. + Bi-Directional（开启双向）
-    8. + Dynamic Focal (Full)（启用动态 focal loss，完整模型）
+    2. + Multi-Scale Encoding（细粒度 + 中粒度 + 全局摘要，对应 3.5 节）
+    3. + AdaptiveFusion（全局上下文 + 局部冲击注意力 + 门控残差，对应 3.3 节）
+    4. + AG-ResUnit + Bi-LSTM（λ 门控 + 残差 + 双向，对应 3.4 节）
+    5. + DynamicFocalLoss（完整 AA-BiLSTM，对应 3.6 节）
 
     每个配置独立训练并报告 AUC/AUC-PR/Accuracy/F1/Sensitivity/Specificity/参数量。
 
@@ -4517,7 +4514,7 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
     # 其余参数直接映射到 AABiLSTM 构造参数。
     configs = [
         {
-            'name': 'Standard LSTM',           # 纯 LSTM 基线，无任何增强
+            'name': 'Standard LSTM (Baseline)',
             'use_cross': False,
             'use_multiscale': False,
             'use_global': False,
@@ -4527,7 +4524,7 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
             'use_focal': False
         },
         {
-            'name': '+ MultiScale only',
+            'name': '+ Multi-Scale Encoding',
             'use_cross': False,
             'use_multiscale': True,
             'use_global': False,
@@ -4537,51 +4534,20 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
             'use_focal': False
         },
         {
-            'name': 'Legacy CrossAttn',
+            'name': '+ AdaptiveFusion',
             'use_cross': True,
             'use_multiscale': True,
             'use_global': True,
             'use_local': True,
-            'use_ag': False,
-            'use_bi': False,
-            'use_focal': False
-        },
-        {
-            'name': '+ Nonlinear Global',
-            'use_cross': True,
-            'use_multiscale': True,
-            'use_global': True,
-            'use_local': False,
             'use_ag': False,
             'use_bi': False,
             'use_focal': False
         }
     ]
-    if enable_local_attention:
-        configs.append({
-            'name': '+ Local Shock Attn',
-            'use_cross': True,
-            'use_multiscale': True,
-            'use_global': True,
-            'use_local': True,
-            'use_ag': False,
-            'use_bi': False,
-            'use_focal': False
-        })
 
     configs.extend([
         {
-            'name': '+ AG-ResUnit',
-            'use_cross': True,
-            'use_multiscale': True,
-            'use_global': True,
-            'use_local': enable_local_attention,
-            'use_ag': True,
-            'use_bi': False,
-            'use_focal': False
-        },
-        {
-            'name': '+ Bi-Directional',
+            'name': '+ AG-ResUnit + Bi-LSTM',
             'use_cross': True,
             'use_multiscale': True,
             'use_global': True,
@@ -4591,7 +4557,7 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
             'use_focal': False
         },
         {
-            'name': '+ Dynamic Focal (Full)',
+            'name': '+ DynamicFocalLoss (Full AA-BiLSTM)',
             'use_cross': True,
             'use_multiscale': True,
             'use_global': True,
