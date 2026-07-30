@@ -4260,7 +4260,9 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
                            class_balance_power=class_balance_power,
                            focal_gamma_max=focal_gamma_max,
                            ema_decay=ema_decay,
-                           calibrate_probabilities=calibrate_probabilities)
+                           calibrate_probabilities=calibrate_probabilities,
+                           seed=seed,
+                           patience=patience)
 
 
     if run_analysis:
@@ -4297,7 +4299,9 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
             class_balance_power=class_balance_power,
             focal_gamma_max=focal_gamma_max,
             ema_decay=ema_decay,
-            calibrate_probabilities=calibrate_probabilities
+            calibrate_probabilities=calibrate_probabilities,
+            seed=seed,
+            patience=patience
         )
 
     if run_analysis:
@@ -4462,7 +4466,9 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
                        class_balance_power=0.5,
                        focal_gamma_max=2.0,
                        ema_decay=0.995,
-                       calibrate_probabilities=True):
+                       calibrate_probabilities=True,
+                       seed=42,
+                       patience=10):
     """
     消融实验：按方法论模块逐一添加，量化各模块对性能的增量贡献。
 
@@ -4556,9 +4562,9 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
     results = []
     for config in configs:
         print(f"\nTesting: {config['name']}")
-        set_seed(42)
+        set_seed(seed)
         if getattr(train_loader, 'generator', None) is not None:
-            train_loader.generator.manual_seed(42)
+            train_loader.generator.manual_seed(seed)
 
         model = AABiLSTM(
             static_dim=static_dim,
@@ -4599,6 +4605,7 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
             calibrate_probabilities=calibrate_probabilities,
             threshold_confidence=threshold_confidence,
         )
+        trainer.early_stopping.patience = patience
 
         metrics, _ = trainer.train()
         row = {
@@ -4707,7 +4714,9 @@ def run_imbalance_robustness_study(X_static_train, X_temporal_train, y_train,
                                    class_balance_power=0.5,
                                    focal_gamma_max=2.0,
                                    ema_decay=0.995,
-                                   calibrate_probabilities=True):
+                                   calibrate_probabilities=True,
+                                   seed=42,
+                                   patience=10):
     """
     类别不平衡鲁棒性实验：在不同训练集违约率下比较 Standard LSTM 与 AA-BiLSTM。
 
@@ -4756,9 +4765,8 @@ def run_imbalance_robustness_study(X_static_train, X_temporal_train, y_train,
 
     results = []
     for rate in target_rates:
-        # 每种违约率使用 deterministic seed：rate*10000 将 0.02→200、0.30→3000，
-        # 加 42 偏移避免与全局 seed 碰撞，同时保证不同 rate 有不同但可复现的初始化
-        set_seed(int(rate * 10000) + 42)
+        # 每种违约率使用 deterministic seed，不同 rate 独立但可复现
+        set_seed(int(rate * 10000) + seed)
         try:
             xs_train, xt_train, ys_train = subsample_training_rate(
                 X_static_train,
@@ -4799,6 +4807,8 @@ def run_imbalance_robustness_study(X_static_train, X_temporal_train, y_train,
             batch_size=batch_size,
             lr=lr
         )
+
+        set_seed(int(rate * 10000) + seed)
 
         aa_model = AABiLSTM(
             static_dim=X_static_train.shape[1],
@@ -4841,6 +4851,7 @@ def run_imbalance_robustness_study(X_static_train, X_temporal_train, y_train,
             calibrate_probabilities=calibrate_probabilities,
             threshold_confidence=threshold_confidence,
         )
+        trainer.early_stopping.patience = patience
         aa_metrics, _ = trainer.train()
         row = {
             'target_rate': rate,
