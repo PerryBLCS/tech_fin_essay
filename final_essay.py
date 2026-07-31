@@ -32,38 +32,7 @@ from collections import Counter
 from statistics import NormalDist
 import warnings
 
-# 抑制已知无害的第三方库警告，保留模型行为相关的真实警告
-warnings.filterwarnings(
-    'ignore',
-    message='.*does not have many workers.*',
-    category=UserWarning,
-)
-warnings.filterwarnings(
-    'ignore',
-    message='.*lbfgs failed to converge.*',
-    category=UserWarning,
-)
-warnings.filterwarnings(
-    'ignore',
-    category=FutureWarning,
-    module='sklearn',
-)
-warnings.filterwarnings(
-    'ignore',
-    category=FutureWarning,
-    module='seaborn',
-)
-# matplotlib 非交互环境下 Agg 后端无害警告
-warnings.filterwarnings(
-    'ignore',
-    message='.*Figures are typically created.*',
-    category=UserWarning,
-)
-warnings.filterwarnings(
-    'ignore',
-    message='.*Solver terminated early.*',
-    category=UserWarning,
-)
+warnings.filterwarnings('ignore')
 
 # ============================================================
 # AA-BiLSTM 信用风险预测模型 — 论文代码
@@ -73,10 +42,9 @@ warnings.filterwarnings(
 #   2. 模型架构：AA-BiLSTM（自适应双向 LSTM）——
 #      包含 AdaptiveFusion 融合模块、AG-ResUnit 门控残差单元、
 #      MultiScaleTemporalEncoder 多尺度时序编码器
-#   3. DynamicFocalLoss 动态焦点损失函数
-#   4. 训练器（含 Platt 概率校准、阈值搜索、EMA、混合精度）
-#   5. SHAP 可解释性分析
-#   6. 对比实验（传统 ML / 深度学习基线、消融实验、不平衡鲁棒性）
+#   3. 训练器（含 Platt 概率校准、阈值搜索、EMA、混合精度）
+#   4. SHAP 可解释性分析
+#   5. 对比实验（传统 ML / 深度学习基线、消融实验、不平衡鲁棒性）
 #
 # 运行入口：python final_essay.py --dataset taiwan
 # ============================================================
@@ -1490,7 +1458,6 @@ class AABiLSTM(nn.Module):
     - 静态和多尺度表示通过跳连直达分类头，避免仅经门控时序分支间接传播
       造成小样本下的信息瓶颈
     - 支持可选的时序类别 Embedding（Taiwan PAY 状态）和位置 Embedding
-    - DynamicFocalLoss 在 Trainer 中启用，不由模型自身管理
 
     Args:
         static_dim: 静态特征维度
@@ -1815,116 +1782,6 @@ class AABiLSTM(nn.Module):
 
 
 # ==============================
-# 3. 动态焦点损失函数
-# ==============================
-
-class DynamicFocalLoss(nn.Module):
-    """
-    动态焦点损失函数（Dynamic Focal Loss）。
-
-    核心机制：
-    - gamma 按 epoch 调度从 gamma_base 增长到 gamma_max，
-      早期接近加权交叉熵（容易收敛），后期增大难样本权重（聚焦难例）
-    - alpha 类别权重在初始化时从训练集全局频率计算，避免 mini-batch 随机抖动
-    - 调度函数：gamma = gamma_base + (gamma_max - gamma_base) * (epoch/num_epoch)^schedule_power
-
-    公式：
-        FL = -α_t * (1 - p_t)^γ * log(p_t)
-
-    Args:
-        alpha_pos: 正类（违约）的全局权重
-        alpha_neg: 负类（正常）的全局权重
-        gamma_base: gamma 起始值
-        gamma_max: gamma 终止值
-        num_epoch: 总 epoch 数（用于 gamma 调度）
-        schedule_power: 调度曲线的幂指数（<1 时 gamma 前期增长快，>1 时后期增长快）
-    """
-
-    def __init__(
-        self,
-        alpha_pos=0.75,
-        alpha_neg=0.25,
-        gamma_base=0.0,
-        gamma_max=2.0,
-        num_epoch=100,
-        schedule_power=1.0,
-    ):
-        super().__init__()
-        if not 0.0 < alpha_pos < 1.0 or not 0.0 < alpha_neg < 1.0:
-            raise ValueError("alpha_pos and alpha_neg must be in (0, 1).")
-        if gamma_base < 0.0 or gamma_max < gamma_base:
-            raise ValueError("Require 0 <= gamma_base <= gamma_max.")
-        if num_epoch < 1:
-            raise ValueError("num_epoch must be at least 1.")
-        if schedule_power <= 0.0:
-            raise ValueError("schedule_power must be positive.")
-
-        self.alpha_pos = float(alpha_pos)  # 正类（违约）全局权重
-        self.alpha_neg = float(alpha_neg)  # 负类（正常）全局权重
-        self.gamma_base = float(gamma_base)
-        self.gamma_max = float(gamma_max)
-        self.num_epoch = int(num_epoch)
-        self.schedule_power = float(schedule_power)
-        self.current_epoch = 0
-
-    def set_epoch(self, epoch):
-        """设置当前 epoch 以调整 gamma"""
-        self.current_epoch = max(int(epoch), 0)
-
-    def forward(self, inputs, targets):
-        """
-        计算当前 epoch 的动态 focal loss。
-
-        使用 log_softmax（而非 softmax + log）避免数值下溢，
-        并 clamp p_t > eps 防止 focal_weight 的 pow 操作出现无效梯度。
-
-        Args:
-            inputs: (N, 2) 模型输出 logits
-            targets: (N,) 真实标签（0 或 1）
-
-        Returns:
-            scalar: 该批次的平均 loss
-        """
-        if inputs.ndim != 2 or inputs.shape[1] != 2:
-            raise ValueError("DynamicFocalLoss expects binary logits with shape [N, 2].")
-        if targets.ndim != 1 or targets.shape[0] != inputs.shape[0]:
-            raise ValueError("targets must have shape [N].")
-
-        # 使用 log_softmax（而非 softmax+log）避免 softmax 下溢；
-        # log_p_t 直接从 log_softmax gather 得到，数值更稳定。
-        log_probs = F.log_softmax(inputs.float(), dim=-1)
-        log_p_t = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
-        p_t = log_p_t.exp()  # 正确类别概率，用于计算 focal 因子
-
-        # gamma 调度：power < 1 时前期增长快（早期即关注难样本），
-        #          power > 1 时后期增长快（先易后难）。
-        progress = min(
-            ((self.current_epoch + 1) / self.num_epoch) ** self.schedule_power,
-            1.0,
-        )
-        gamma = self.gamma_base + (
-            self.gamma_max - self.gamma_base
-        ) * progress
-
-        # alpha 由训练集全局频率确定（初始化为固定值），不随 mini-batch 变化
-        alpha_t = torch.where(
-            targets == 1,
-            log_p_t.new_tensor(self.alpha_pos),
-            log_p_t.new_tensor(self.alpha_neg),
-        )
-        # focal_weight = (1-p_t)^γ：p_t 越大（越容易），权重越小
-        # clamp_min(eps) 防止 p_t=1 时 pow 操作的梯度退化
-        focal_base = (1.0 - p_t).clamp_min(
-            torch.finfo(p_t.dtype).eps
-        )
-        focal_weight = focal_base.pow(gamma)
-        # FL = -α_t * (1-p_t)^γ * log(p_t)
-        loss = -alpha_t * focal_weight * log_p_t
-
-        return loss.mean()
-
-
-# ==============================
 # 4. 训练与评估
 # ==============================
 
@@ -1992,12 +1849,9 @@ class Trainer:
     def __init__(self, model, train_loader, val_loader, test_loader,
                  calibration_loader=None,
                  num_epochs=100, lr=1e-3, weight_decay=1e-4,
-                 use_dynamic_focal=True, use_class_weight=False,
                  use_early_stopping=False, threshold_min_sensitivity=0.40,
                  selection_metric='auc_pr',
                  threshold_objective='hybrid',
-                 class_balance_power=0.5,
-                 focal_gamma_max=2.0,
                  ema_decay=0.995,
                  calibrate_probabilities=True,
                  threshold_confidence=0.80):
@@ -2015,10 +1869,6 @@ class Trainer:
                 "threshold_objective must be 'hybrid', 'f1', "
                 "'balanced_accuracy' or 'accuracy'."
             )
-        if not 0.0 <= class_balance_power <= 1.0:
-            raise ValueError("class_balance_power must be in [0, 1].")
-        if focal_gamma_max < 0.0:
-            raise ValueError("focal_gamma_max must be non-negative.")
         if ema_decay is not None and not 0.0 < ema_decay < 1.0:
             raise ValueError("ema_decay must be in (0, 1) or None.")
         if not 0.5 <= threshold_confidence < 1.0:
@@ -2036,8 +1886,6 @@ class Trainer:
         self.use_early_stopping = use_early_stopping
         self.selection_metric = selection_metric
         self.threshold_objective = threshold_objective
-        self.class_balance_power = float(class_balance_power)
-        self.focal_gamma_max = float(focal_gamma_max)
         self.ema_decay = ema_decay
         self.calibrate_probabilities = bool(calibrate_probabilities)
         self.temperature = 1.0
@@ -2070,40 +1918,8 @@ class Trainer:
             T_max=num_epochs
         )
 
-        # 损失函数
-        if use_dynamic_focal:
-            counts = self._compute_class_counts(train_loader)
-            # class_balance_power=0.5：次幂根比完全逆频率温和。
-            #   完全逆频率（power=1.0）→ 极端少数类 alpha≈0.9+
-            #   平方根（power=0.5）→ 少数类 alpha≈0.7~0.8
-            # 温和的 alpha 减少假阳性（False Positive），再由验证集阈值保障敏感性。
-            raw_weights = np.power(
-                1.0 / np.maximum(counts, 1.0),
-                self.class_balance_power,
-            )
-            raw_weights /= raw_weights.sum()
-            alpha_neg = float(raw_weights[0])
-            alpha_pos = float(raw_weights[1])
-            self.criterion = DynamicFocalLoss(
-                num_epoch=num_epochs,
-                alpha_pos=alpha_pos,
-                alpha_neg=alpha_neg,
-                gamma_base=0.0,
-                gamma_max=self.focal_gamma_max,
-                schedule_power=0.5,
-            )
-            print(
-                f"Dynamic focal loss: alpha_neg={alpha_neg:.3f}, "
-                f"alpha_pos={alpha_pos:.3f}, "
-                f"gamma=0.0->{self.focal_gamma_max:.1f}"
-            )
-        else:
-            # 标准交叉熵更适合优化整体 Accuracy；如需强调少数类可打开 use_class_weight
-            if use_class_weight:
-                weights = self._compute_class_weights(train_loader)
-                self.criterion = nn.CrossEntropyLoss(weight=weights.to(device))
-            else:
-                self.criterion = nn.CrossEntropyLoss()
+        # 损失函数：标准交叉熵
+        self.criterion = nn.CrossEntropyLoss()
 
         self.early_stopping = EarlyStopping(patience=10)
         self.history = {
@@ -2132,36 +1948,6 @@ class Trainer:
             self.scaler = torch.cuda.amp.GradScaler(
                 enabled=self.amp_enabled,
             )
-
-    @staticmethod
-    def _compute_class_counts(loader):
-        """从训练数据集读取全局类别数。
-
-        CreditDataset 始终暴露 .labels 属性，因此直接读取；
-        遍历 DataLoader 的分支为通用数据集兼容路径（CreditDataset 下不可达）。
-        """
-        labels = loader.dataset.labels
-        if torch.is_tensor(labels):
-            labels = labels.cpu().numpy()
-        counts = np.bincount(np.asarray(labels, dtype=np.int64), minlength=2)
-        if len(counts) != 2 or np.any(counts == 0):
-            raise ValueError(
-                f"Training data must contain both binary classes; got {counts.tolist()}."
-            )
-        return counts.astype(np.float64)
-
-    @classmethod
-    def _compute_class_weights(cls, loader):
-        """计算全局 inverse-frequency 类别权重。
-
-        公式：w_i = (1/count_i) / sum(1/counts) * 2
-        *2 使得二分类任务中权重均值为 1（即 loss 量级与不加权一致），
-        避免权重整体偏大导致学习率需要重新调节。
-        """
-        counts = cls._compute_class_counts(loader)
-        weights = 1.0 / counts
-        weights = weights / weights.sum() * 2
-        return torch.FloatTensor(weights)
 
     def _update_ema(self):
         """更新模型权重的指数移动平均（EMA）。
@@ -2372,14 +2158,12 @@ class Trainer:
         """训练一个 epoch：混合精度前向 → 反向 → 梯度裁剪 → 优化器步进 → EMA 更新。
 
         Args:
-            epoch: 当前 epoch 编号（用于 DynamicFocalLoss 的 gamma 调度）
+            epoch: 当前 epoch 编号
 
         Returns:
             float: 该 epoch 的平均训练 loss
         """
         self.model.train()
-        if isinstance(self.criterion, DynamicFocalLoss):
-            self.criterion.set_epoch(epoch)
 
         total_loss = 0.0
         total_samples = 0
@@ -3508,10 +3292,8 @@ def run_experiment(dataset_name='taiwan', epoch=None, batch_size=None, data_path
                    split_seed=42,
                    hidden_dim=None, num_layers=None,
                    dropout=None, lr=None, weight_decay=None,
-                   loss_name='dynamic_focal', selection_metric='auc_pr',
+                   selection_metric='auc_pr',
                    threshold_objective='hybrid',
-                   class_balance_power=0.5,
-                   focal_gamma_max=None,
                    ema_decay=None,
                    calibrate_probabilities=True,
                    analysis_on_test=False,
@@ -3547,11 +3329,8 @@ def run_experiment(dataset_name='taiwan', epoch=None, batch_size=None, data_path
         dropout: Dropout 比率（None 时使用数据集默认值）
         lr: 学习率（None 时使用数据集默认值）
         weight_decay: 权重衰减（None 时使用数据集默认值）
-        loss_name: 损失函数类型 ('dynamic_focal' / 'weighted_ce' / 'cross_entropy')
         selection_metric: checkpoint 选择指标
         threshold_objective: 阈值搜索目标
-        class_balance_power: 类别平衡幂指数
-        focal_gamma_max: focal loss 的 gamma_max
         ema_decay: EMA 衰减率
         calibrate_probabilities: 是否做 Platt 概率校准
         analysis_on_test: 分析时使用测试集（默认使用验证集保护 holdout）
@@ -3565,10 +3344,6 @@ def run_experiment(dataset_name='taiwan', epoch=None, batch_size=None, data_path
     dataset_name = dataset_name.lower()
     if dataset_name != 'taiwan':
         raise ValueError("dataset_name must be 'taiwan'.")
-    if loss_name not in {'dynamic_focal', 'weighted_ce', 'cross_entropy'}:
-        raise ValueError(
-            "loss_name must be 'dynamic_focal', 'weighted_ce' or 'cross_entropy'."
-        )
     if threshold_min_sensitivity is None:
         threshold_min_sensitivity = (
             0.55
@@ -3602,9 +3377,6 @@ def run_experiment(dataset_name='taiwan', epoch=None, batch_size=None, data_path
     dropout = 0.30 if dropout is None else dropout
     lr = 7e-4 if lr is None else lr
     weight_decay = 2e-4 if weight_decay is None else weight_decay
-    focal_gamma_max = (
-        1.75 if focal_gamma_max is None else focal_gamma_max
-    )
     ema_decay = 0.995 if ema_decay is None else ema_decay
     patience = 15
 
@@ -3629,7 +3401,7 @@ def run_experiment(dataset_name='taiwan', epoch=None, batch_size=None, data_path
     print(
         f"Config: seed={seed}, epochs={epoch}, batch={batch_size}, "
         f"hidden={hidden_dim}, layers={num_layers}, dropout={dropout:.2f}, "
-        f"lr={lr:g}, loss={loss_name}, select={selection_metric}, "
+        f"lr={lr:g}, select={selection_metric}, "
         f"split_seed={split_seed}"
     )
 
@@ -3775,14 +3547,10 @@ def run_experiment(dataset_name='taiwan', epoch=None, batch_size=None, data_path
                 num_epochs=min(tune_epochs, epoch),
                 lr=candidate_lr,
                 weight_decay=weight_decay,
-                use_dynamic_focal=loss_name == 'dynamic_focal',
-                use_class_weight=loss_name == 'weighted_ce',
                 use_early_stopping=True,
                 threshold_min_sensitivity=threshold_min_sensitivity,
                 selection_metric=selection_metric,
                 threshold_objective=threshold_objective,
-                class_balance_power=class_balance_power,
-                focal_gamma_max=focal_gamma_max,
                 ema_decay=None,
                 calibrate_probabilities=False,
                 threshold_confidence=threshold_confidence,
@@ -3835,14 +3603,10 @@ def run_experiment(dataset_name='taiwan', epoch=None, batch_size=None, data_path
         num_epochs=epoch,
         lr=lr,
         weight_decay=weight_decay,
-        use_dynamic_focal=loss_name == 'dynamic_focal',
-        use_class_weight=loss_name == 'weighted_ce',
         use_early_stopping=True,
         threshold_min_sensitivity=threshold_min_sensitivity,
         selection_metric=selection_metric,
         threshold_objective=threshold_objective,
-        class_balance_power=class_balance_power,
-        focal_gamma_max=focal_gamma_max,
         ema_decay=ema_decay,
         calibrate_probabilities=calibrate_probabilities,
         threshold_confidence=threshold_confidence,
@@ -3860,7 +3624,6 @@ def run_experiment(dataset_name='taiwan', epoch=None, batch_size=None, data_path
         'dropout': float(dropout),
         'learning_rate': float(lr),
         'batch_size': int(batch_size),
-        'loss_name': loss_name,
     })
     test_metrics.update(bootstrap_metric_intervals(
         test_metrics['labels'],
@@ -3875,14 +3638,11 @@ def run_experiment(dataset_name='taiwan', epoch=None, batch_size=None, data_path
         'dataset': dataset_name,
         'seed': int(seed),
         'split_seed': int(split_seed),
-        'loss_name': loss_name,
         'selection_metric': selection_metric,
         'threshold_objective': threshold_objective,
         'threshold_min_sensitivity': float(
             threshold_min_sensitivity
         ),
-        'class_balance_power': float(class_balance_power),
-        'focal_gamma_max': float(focal_gamma_max),
         'ema_decay': float(ema_decay),
         'threshold_confidence': float(threshold_confidence),
         'calibration_method': 'cross_fitted_platt',
@@ -3967,8 +3727,6 @@ def run_experiment(dataset_name='taiwan', epoch=None, batch_size=None, data_path
                            threshold_min_sensitivity=threshold_min_sensitivity,
                            selection_metric=selection_metric,
                            threshold_objective=threshold_objective,
-                           class_balance_power=class_balance_power,
-                           focal_gamma_max=focal_gamma_max,
                            ema_decay=ema_decay,
                            calibrate_probabilities=calibrate_probabilities,
                            seed=seed,
@@ -4006,8 +3764,6 @@ def run_experiment(dataset_name='taiwan', epoch=None, batch_size=None, data_path
             threshold_min_sensitivity=threshold_min_sensitivity,
             selection_metric=selection_metric,
             threshold_objective=threshold_objective,
-            class_balance_power=class_balance_power,
-            focal_gamma_max=focal_gamma_max,
             ema_decay=ema_decay,
             calibrate_probabilities=calibrate_probabilities,
             seed=seed,
@@ -4173,8 +3929,6 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
                        threshold_min_sensitivity=0.40,
                        selection_metric='auc_pr',
                        threshold_objective='hybrid',
-                       class_balance_power=0.5,
-                       focal_gamma_max=2.0,
                        ema_decay=0.995,
                        calibrate_probabilities=True,
                        seed=42,
@@ -4187,7 +3941,6 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
     2. + Multi-Scale Encoding（细粒度 + 中粒度 + 全局摘要，对应 3.5 节）
     3. + AdaptiveFusion（全局上下文 + 局部冲击注意力 + 门控残差，对应 3.3 节）
     4. + AG-ResUnit + Bi-LSTM（λ 门控 + 残差 + 双向，对应 3.4 节）
-    5. + DynamicFocalLoss（完整 AA-BiLSTM，对应 3.6 节）
 
     每个配置独立训练并报告 AUC/AUC-PR/Accuracy/F1/Sensitivity/Specificity/参数量。
 
@@ -4222,7 +3975,6 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
             'use_local': False,
             'use_ag': False,
             'use_bi': False,
-            'use_focal': False,
             'use_standard_lstm': True,
         },
         {
@@ -4233,7 +3985,6 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
             'use_local': False,
             'use_ag': False,
             'use_bi': False,
-            'use_focal': False
         },
         {
             'name': '+ AdaptiveFusion',
@@ -4243,7 +3994,6 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
             'use_local': True,
             'use_ag': False,
             'use_bi': False,
-            'use_focal': False
         }
     ]
 
@@ -4256,18 +4006,7 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
             'use_local': enable_local_attention,
             'use_ag': True,
             'use_bi': True,
-            'use_focal': False
         },
-        {
-            'name': '+ DynamicFocalLoss (Full AA-BiLSTM)',
-            'use_cross': True,
-            'use_multiscale': True,
-            'use_global': True,
-            'use_local': enable_local_attention,
-            'use_ag': True,
-            'use_bi': True,
-            'use_focal': True
-        }
     ])
 
     results = []
@@ -4339,13 +4078,10 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
                 num_epochs=epoch,
                 lr=lr,
                 weight_decay=weight_decay,
-                use_dynamic_focal=config['use_focal'],
                 use_early_stopping=True,
                 threshold_min_sensitivity=threshold_min_sensitivity,
                 selection_metric=selection_metric,
                 threshold_objective=threshold_objective,
-                class_balance_power=class_balance_power,
-                focal_gamma_max=focal_gamma_max,
                 ema_decay=ema_decay,
                 calibrate_probabilities=calibrate_probabilities,
                 threshold_confidence=threshold_confidence,
@@ -4455,8 +4191,6 @@ def run_imbalance_robustness_study(X_static_train, X_temporal_train, y_train,
                                    threshold_min_sensitivity=0.40,
                                    selection_metric='auc_pr',
                                    threshold_objective='hybrid',
-                                   class_balance_power=0.5,
-                                   focal_gamma_max=2.0,
                                    ema_decay=0.995,
                                    calibrate_probabilities=True,
                                    seed=42,
@@ -4584,13 +4318,10 @@ def run_imbalance_robustness_study(X_static_train, X_temporal_train, y_train,
             num_epochs=epoch,
             lr=lr,
             weight_decay=weight_decay,
-            use_dynamic_focal=True,
             use_early_stopping=True,
             threshold_min_sensitivity=threshold_min_sensitivity,
             selection_metric=selection_metric,
             threshold_objective=threshold_objective,
-            class_balance_power=class_balance_power,
-            focal_gamma_max=focal_gamma_max,
             ema_decay=ema_decay,
             calibrate_probabilities=calibrate_probabilities,
             threshold_confidence=threshold_confidence,
@@ -4789,12 +4520,6 @@ def parse_args():
     parser.add_argument('--weight-decay', type=float, default=None,
                         help='Override the dataset-specific AdamW weight decay.')
     parser.add_argument(
-        '--loss',
-        choices=['dynamic_focal', 'weighted_ce', 'cross_entropy'],
-        default='dynamic_focal',
-        help='Training loss; dynamic_focal is the recommended default.',
-    )
-    parser.add_argument(
         '--selection-metric',
         choices=['auc', 'auc_pr', 'hybrid', 'accuracy'],
         default='auc_pr',
@@ -4836,18 +4561,6 @@ def parse_args():
         type=int,
         default=10,
         help='Epoch budget per lightweight tuning candidate.',
-    )
-    parser.add_argument(
-        '--class-balance-power',
-        type=float,
-        default=0.5,
-        help='Focal class-balance strength in [0,1]; 0.5 is less aggressive.',
-    )
-    parser.add_argument(
-        '--focal-gamma-max',
-        type=float,
-        default=None,
-        help='Override final focal gamma (default: 1.75).',
     )
     parser.add_argument(
         '--ema-decay',
@@ -5116,11 +4829,8 @@ if __name__ == '__main__':
         dropout=args.dropout,
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
-        loss_name=args.loss,
         selection_metric=args.selection_metric,
         threshold_objective=args.threshold_objective,
-        class_balance_power=args.class_balance_power,
-        focal_gamma_max=args.focal_gamma_max,
         ema_decay=args.ema_decay,
         calibrate_probabilities=args.calibrate_probabilities,
         analysis_on_test=args.analysis_on_test,
