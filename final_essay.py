@@ -69,7 +69,7 @@ warnings.filterwarnings(
 # AA-BiLSTM 信用风险预测模型 — 论文代码
 # ============================================================
 # 本代码主要包括：
-#   1. 数据加载与预处理（German Credit / Taiwan Credit 数据集）
+#   1. 数据加载与预处理（Taiwan Credit 数据集）
 #   2. 模型架构：AA-BiLSTM（自适应双向 LSTM）——
 #      包含 AdaptiveFusion 融合模块、AG-ResUnit 门控残差单元、
 #      MultiScaleTemporalEncoder 多尺度时序编码器
@@ -78,10 +78,9 @@ warnings.filterwarnings(
 #   5. SHAP 可解释性分析
 #   6. 对比实验（传统 ML / 深度学习基线、消融实验、不平衡鲁棒性）
 #
-# 运行入口：python final_essay.py --dataset german 或 --dataset taiwan
+# 运行入口：python final_essay.py --dataset taiwan
 # ============================================================
 
-GERMAN_CREDIT_URL = "https://archive.ics.uci.edu/ml/machine-learning-databases/statlog/german/german.data"
 TAIWAN_CREDIT_URL = "https://archive.ics.uci.edu/ml/machine-learning-databases/00350/default%20of%20credit%20card%20clients.xls"
 
 
@@ -102,7 +101,7 @@ def set_seed(seed, deterministic=True):
 
 
 # 设备选择：优先使用 CUDA GPU，否则回退到 CPU
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cpu')   #如果有cuda的话可以搞这一句：'cuda' if torch.cuda.is_available() else 'cpu'
 # 启用高精度矩阵乘法（PyTorch 2.0+ 支持），提升 float32 计算精度
 if hasattr(torch, 'set_float32_matmul_precision'):
     torch.set_float32_matmul_precision('high')
@@ -114,17 +113,17 @@ if hasattr(torch, 'set_float32_matmul_precision'):
 
 class CreditDataLoader:
     """
-    German Credit 和 Taiwan Credit 数据集的加载与预处理。
+    Taiwan Credit 数据集的加载与预处理。
 
     负责：
     - 加载原始数据（本地文件或 UCI 在线源）
-    - 构建静态特征（数值 + one-hot 类别）和时序特征（真实月度或伪时序）
+    - 构建静态特征（数值 + one-hot 类别）和时序特征（真实月度数据）
     - 训练集拟合类别编码与 StandardScaler，避免分布信息泄漏
     - 按 train / validation / calibration / test 四层分割数据
     - 导出部署所需的预处理状态（特征名、缩放器参数、类别映射）
 
     Attributes:
-        dataset_name: 数据集名称（'german' 或 'taiwan'）
+        dataset_name: 数据集名称
         scaler: 静态连续特征的 StandardScaler
         temporal_scaler: 时序连续特征的 StandardScaler
         static_feature_names: 静态特征列名列表
@@ -154,178 +153,6 @@ class CreditDataLoader:
         self._raw_static_categorical_names = None
         self._raw_static_prefixes = None
 
-        # German 伪时序的类别编码和频率也必须只由训练集确定。
-        self._german_raw_temporal = None
-        self._german_selected_cols = None
-        self._german_risk_priors = None
-        self.german_temporal_maps_ = None
-
-    def load_german_credit(self, filepath=None):
-        """
-        加载 German Credit 数据集（1000 样本, 20 特征, 约 30% 违约率）。
-
-        将 6 个类别属性编码为伪时序数据（category_code / risk_prior / category_frequency），
-        其余 7 个类别属性做 one-hot 编码后与 7 个数值特征合并为静态特征。
-
-        Args:
-            filepath: 本地数据文件路径，为 None 时自动从 UCI 在线下载
-
-        Returns:
-            static_features: (N, S) 静态特征矩阵
-            temporal_features: (N, 6, 3) 伪时序特征矩阵
-            y: (N,) 二分类标签（1=违约）
-
-        Raises:
-            ValueError: 数据形状不符合预期
-        """
-        # 如果没有提供文件路径, 使用 UCI 在线数据
-        self.dataset_name = 'german'
-        self.temporal_categorical_indices_ = []
-        source = GERMAN_CREDIT_URL if filepath is None else filepath
-        print(f"Loading German Credit data from: {source}")
-        df = pd.read_csv(source, sep=r"\s+", header=None)
-
-        # 分支 1：已预处理的 25 列格式（前 6 列为静态数值特征，
-        # 后 18 列已按 6 个类别字段 × 3 个编码维度展开为伪时序）
-        if df.shape[1] == 25:
-            data = df.astype(float).values
-            X = data[:, :-1]
-            # German 标签：1=Good, 2=Bad → 转换为 0/1（1=违约）
-            y = (data[:, -1] == 2).astype(int)
-            static_features = X[:, :6].astype(np.float32)
-            # 18 列 → (N, 6步, 3通道)：category_code / risk_prior / category_frequency
-            temporal_features = X[:, 6:].reshape(X.shape[0], 6, 3).astype(np.float32)
-            self.static_feature_names = [f'german_static_{i}' for i in range(static_features.shape[1])]
-            self.temporal_feature_names = ['category_code', 'risk_prior', 'category_frequency']
-            self.temporal_step_names = [f'german_category_step_{i}' for i in range(6)]
-            self.temporal_flat_feature_names = [
-                f'{step}_{feature}'
-                for step in self.temporal_step_names
-                for feature in self.temporal_feature_names
-            ]
-            return static_features, temporal_features, y
-
-        # 分支 2：原始 UCI 21 列格式（20 特征 + 1 标签），需要手动构建特征
-        if df.shape[1] != 21:
-            raise ValueError(
-                f"Unexpected German Credit data shape: {df.shape}. "
-                "Expected raw german.data with 20 features + 1 label."
-            )
-
-        # 标签：1=Good, 2=Bad → 0/1
-        y = (df.iloc[:, -1].astype(int).values == 2).astype(int)
-
-        # --- 列分组 ---
-        # German Credit 的 20 个特征中：
-        #   7 个数值列（Duration, CreditAmount, InstallmentRate, ResidenceSince,
-        #               Age, ExistingCredits, NumLiable）
-        numeric_cols = [1, 4, 7, 10, 12, 15, 17]
-        #   13 个类别列，其中 6 个用作伪时序（有明确语义且可排序），
-        #   其余 7 个做 one-hot
-        categorical_cols = [0, 2, 3, 5, 6, 8, 9, 11, 13, 14, 16, 18, 19]
-        pseudo_temporal_cols = [0, 2, 3, 5, 6, 8]
-        static_categorical_cols = [col for col in categorical_cols if col not in pseudo_temporal_cols]
-
-        # 1. 数值特征
-        numeric_df = df[numeric_cols].astype(np.float32)
-        self._raw_static_numeric = numeric_df.to_numpy(dtype=np.float32)
-        self._raw_static_numeric_names = [str(c) for c in numeric_cols]
-        self._raw_static_categorical = (
-            df[static_categorical_cols].astype(str).to_numpy()
-        )
-        self._raw_static_categorical_names = [
-            str(c) for c in static_categorical_cols
-        ]
-        self._raw_static_prefixes = [
-            f"A{col}" for col in static_categorical_cols
-        ]
-
-        # 2. 类别特征独热编码
-        categorical_df = pd.get_dummies(
-            df[static_categorical_cols].astype(str),
-            prefix=[f"A{col}" for col in static_categorical_cols],
-            dtype=np.float32
-        )
-
-        # 3. 合并为静态特征
-        static_features = pd.concat([numeric_df, categorical_df], axis=1).values.astype(np.float32)
-        self.static_feature_names = [str(c) for c in list(numeric_df.columns) + list(categorical_df.columns)]
-
-        # 4. 构建伪时序特征：按顺序使用6个类别属性
-        temporal_features = self._build_german_pseudo_temporal(df).astype(np.float32)
-
-        return static_features, temporal_features, y
-
-    def _build_german_pseudo_temporal(self, df):
-        """基于六个分类属性构建伪时序特征。
-
-        German Credit 没有真实时间维度，本方法将 6 个语义不同的类别字段
-        （支票账户状态、信用历史、贷款用途、储蓄账户、就业时长、个人状态）
-        排列为"伪时间步"，每个步用三个描述符编码：
-          - category_code: 类别归一化索引 [0, 1]
-          - risk_prior: 基于领域知识的手工风险先验概率
-          - category_frequency: 类别在数据集中的出现频率
-        """
-        selected_cols = [0, 2, 3, 5, 6, 8]
-        self.temporal_step_names = [
-            'checking_status',
-            'credit_history',
-            'purpose',
-            'savings_account',
-            'employment_since',
-            'personal_status_sex',
-        ]
-        self.temporal_feature_names = ['category_code', 'risk_prior', 'category_frequency']
-        self.temporal_flat_feature_names = [
-            f'{step}_{feature}'
-            for step in self.temporal_step_names
-            for feature in self.temporal_feature_names
-        ]
-
-        # 风险先验：基于 German Credit 数据集的领域知识手工设定。
-        # 值为该类别子组的经验违约概率，高值 = 高风险。
-        # 例如 A11（无支票账户）违约率 ≈ 1.00，A14（高额支票账户）≈ 0.15。
-        risk_priors = {
-            0: {'A11': 1.00, 'A12': 0.65, 'A13': 0.35, 'A14': 0.15},        # 支票账户状态
-            2: {'A30': 1.00, 'A31': 0.75, 'A32': 0.50, 'A33': 0.30, 'A34': 0.15},  # 信用历史
-            3: {'A40': 0.55, 'A41': 0.25, 'A42': 0.45, 'A43': 0.35, 'A44': 0.65,
-                'A45': 0.60, 'A46': 0.70, 'A48': 0.25, 'A49': 0.50, 'A410': 0.40},  # 贷款用途
-            5: {'A61': 0.90, 'A62': 0.60, 'A63': 0.40, 'A64': 0.20, 'A65': 0.50},   # 储蓄账户
-            6: {'A71': 0.85, 'A72': 0.65, 'A73': 0.45, 'A74': 0.30, 'A75': 0.20},   # 就业时长
-            8: {'A91': 0.50, 'A92': 0.45, 'A93': 0.35, 'A94': 0.30, 'A95': 0.40},   # 个人状态/性别
-        }
-        self._german_selected_cols = list(selected_cols)
-        self._german_risk_priors = copy.deepcopy(risk_priors)
-        self._german_raw_temporal = np.stack(
-            [df[col].astype(str).to_numpy() for col in selected_cols],
-            axis=1,
-        )
-
-        steps = []
-        n_rows = len(df)
-        for col in selected_cols:
-            values = df[col].astype(str)
-            categories = sorted(values.unique())
-            # 类别数减 1 做分母，使 code 归一化到 [0, 1]；
-            # 只有一个类别时分母为 1，避免除以零。
-            denom = max(len(categories) - 1, 1)
-            # code_map: 类别值 → [0, 1] 的均匀等距编码，反映类别间的序关系
-            code_map = {cat: idx / denom for idx, cat in enumerate(categories)}
-            # 频率映射：类别在数据集中出现的比例
-            frequency_map = (values.value_counts() / max(n_rows, 1)).to_dict()
-            # 风险先验：仅当 col 在 risk_priors 中有定义时使用
-            priors = risk_priors.get(col, {})
-
-            # 三个编码通道
-            category_code = values.map(code_map).astype(float).values
-            # risk_prior 优先用先验值，未知类别退回到 code_map 值（0.5 默认）
-            risk_prior = values.map(lambda v: priors.get(v, code_map.get(v, 0.5))).astype(float).values
-            category_frequency = values.map(frequency_map).astype(float).values
-            # 每个类别字段 → (N, 3) 描述符
-            steps.append(np.stack([category_code, risk_prior, category_frequency], axis=1))
-
-        # 6 个类别字段 → (N, 6, 3)
-        return np.stack(steps, axis=1)
 
     def load_taiwan_credit(self, filepath=None):
         """
@@ -629,84 +456,6 @@ class CreditDataLoader:
             ]
         )
 
-    def _encode_german_temporal_from_training(
-        self,
-        train_idx,
-        *evaluation_indices,
-    ):
-        """训练集拟合 German 伪时序的类别 code/frequency，再编码全部子集。
-
-        核心思路：先用训练集的类别词表和出现频率构建 code_map 和 frequency_map，
-        然后对验证/校准/测试集使用同一套映射，防止测试数据的分布信息泄漏。
-
-        Args:
-            train_idx: 训练样本索引
-            *evaluation_indices: 待编码的评估集索引
-
-        Returns:
-            tuple of ndarray: 各子集的编码后时序特征；无 German 时序数据时返回 None
-        """
-        if self._german_raw_temporal is None:
-            return None
-
-        raw = self._german_raw_temporal
-        maps = []
-        for step, col in enumerate(self._german_selected_cols):
-            train_values = raw[train_idx, step]
-            categories = sorted(np.unique(train_values).tolist())
-            denominator = max(len(categories) - 1, 1)
-            code_map = {
-                category: idx / denominator
-                for idx, category in enumerate(categories)
-            }
-            counts = pd.Series(train_values).value_counts(normalize=True)
-            frequency_map = {
-                str(category): float(value)
-                for category, value in counts.items()
-            }
-            maps.append({
-                'column': int(col),
-                'code': code_map,
-                'frequency': frequency_map,
-            })
-        self.german_temporal_maps_ = maps
-
-        def encode(indices):
-            """用训练集拟合的 code/frequency map 对指定索引的样本做编码。"""
-            encoded_steps = []
-            for step, col in enumerate(self._german_selected_cols):
-                values = raw[indices, step]
-                code_map = maps[step]['code']
-                frequency_map = maps[step]['frequency']
-                priors = self._german_risk_priors.get(col, {})
-                # 训练集中未见过的类别 → code 默认 0.5（中间值）
-                category_code = np.asarray(
-                    [code_map.get(value, 0.5) for value in values],
-                    dtype=np.float32,
-                )
-                # 先验未知 → 回退到 code_map 值（默认 0.5）
-                risk_prior = np.asarray(
-                    [
-                        priors.get(value, code_map.get(value, 0.5))
-                        for value in values
-                    ],
-                    dtype=np.float32,
-                )
-                # 训练集中未见过的类别 → frequency 默认 0.0
-                category_frequency = np.asarray(
-                    [frequency_map.get(value, 0.0) for value in values],
-                    dtype=np.float32,
-                )
-                encoded_steps.append(np.stack(
-                    [category_code, risk_prior, category_frequency],
-                    axis=1,
-                ))
-            return np.stack(encoded_steps, axis=1)
-
-        return tuple(
-            encode(idx) for idx in (train_idx, *evaluation_indices)
-        )
-
     @staticmethod
     def _scaler_state(scaler):
         """导出 StandardScaler 的拟合参数，用于部署时复现完全相同的缩放。
@@ -759,15 +508,6 @@ class CreditDataLoader:
             'raw_static_prefixes': list(self._raw_static_prefixes or []),
             'static_scaler': self._scaler_state(self.scaler),
             'temporal_scaler': self._scaler_state(self.temporal_scaler),
-            'german_temporal_maps': copy.deepcopy(
-                self.german_temporal_maps_
-            ),
-            'german_selected_cols': copy.deepcopy(
-                self._german_selected_cols
-            ),
-            'german_risk_priors': copy.deepcopy(
-                self._german_risk_priors
-            ),
             'taiwan_amount_transform': 'signed_log1p_v1',
         }
 
@@ -891,26 +631,12 @@ class CreditDataLoader:
                 X_static_test,
             ) = encoded_static
 
-        encoded_german = self._encode_german_temporal_from_training(
-            train_idx,
-            val_idx,
-            calibration_idx,
-            test_idx,
-        )
-        if encoded_german is None:
-            X_temporal_train = temporal_features[train_idx].copy()
-            X_temporal_val = temporal_features[val_idx].copy()
-            X_temporal_calibration = temporal_features[
-                calibration_idx
-            ].copy()
-            X_temporal_test = temporal_features[test_idx].copy()
-        else:
-            (
-                X_temporal_train,
-                X_temporal_val,
-                X_temporal_calibration,
-                X_temporal_test,
-            ) = encoded_german
+        X_temporal_train = temporal_features[train_idx].copy()
+        X_temporal_val = temporal_features[val_idx].copy()
+        X_temporal_calibration = temporal_features[
+            calibration_idx
+        ].copy()
+        X_temporal_test = temporal_features[test_idx].copy()
 
         y_train = y[train_idx]
         y_val = y[val_idx]
@@ -1547,7 +1273,7 @@ class MultiScaleTemporalEncoder(nn.Module):
     - 粗粒度（年度）：12 个月滑动窗口编码；不足 12 个月时退化为全局趋势摘要
 
     支持两种模式：
-    - 'legacy'：每个尺度用独立 BiLSTM 编码（适合小数据集如 German）
+    - 'legacy'：每个尺度用独立 BiLSTM 编码
     - 'lightweight'：用统计量 + Conv1d 平滑替代 BiLSTM（参数更少，适合 Taiwan）
 
     Args:
@@ -1943,7 +1669,7 @@ class AABiLSTM(nn.Module):
 
         # 分类头输入 = 时序池化 + 静态嵌入（跳连）+ 多尺度（跳连，可选）
         # 跳连设计确保静态/多尺度信息不依赖门控时序分支间接传播；
-        # 在小样本数据集（如 German，仅 1000 样本）上这对避免信息瓶颈至关重要。
+        # 这对避免信息瓶颈至关重要。
         classifier_input_dim = sequence_dim + hidden_dim
         if use_multiscale:
             classifier_input_dim += multi_scale_dim
@@ -3774,8 +3500,9 @@ def bootstrap_metric_intervals(
 # 6. 主程序
 # ==============================
 
-def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path=None,
-                   run_analysis=True, make_plots=True,
+def run_experiment(dataset_name='taiwan', epoch=None, batch_size=None, data_path=None,
+                   run_baselines=True, run_ablation=True, run_robustness=True,
+                   run_shap=True, make_plots=True,
                    threshold_min_sensitivity=None,
                    seed=None,
                    split_seed=42,
@@ -3803,11 +3530,14 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
     6. 可选：SHAP 解释 + 训练历史可视化
 
     Args:
-        dataset_name: 'german' 或 'taiwan'
+        dataset_name: 'taiwan'
         epoch: 训练轮数（None 时使用数据集默认值）
         batch_size: 批次大小（None 时使用数据集默认值）
         data_path: 本地数据文件路径
-        run_analysis: 是否运行额外分析（baselines + 消融 + 鲁棒性 + SHAP）
+        run_baselines: 是否运行基线模型对比
+        run_ablation: 是否运行消融实验
+        run_robustness: 是否运行不平衡鲁棒性实验
+        run_shap: 是否运行 SHAP 可解释性分析
         make_plots: 是否生成训练曲线和混淆矩阵图
         threshold_min_sensitivity: 阈值搜索的敏感性下限
         seed: 模型随机种子
@@ -3833,21 +3563,21 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
         (model, test_metrics, history): 训练好的模型、测试指标字典、训练历史
     """
     dataset_name = dataset_name.lower()
-    if dataset_name not in {'german', 'taiwan'}:
-        raise ValueError("dataset_name must be 'german' or 'taiwan'.")
+    if dataset_name != 'taiwan':
+        raise ValueError("dataset_name must be 'taiwan'.")
     if loss_name not in {'dynamic_focal', 'weighted_ce', 'cross_entropy'}:
         raise ValueError(
             "loss_name must be 'dynamic_focal', 'weighted_ce' or 'cross_entropy'."
         )
     if threshold_min_sensitivity is None:
         threshold_min_sensitivity = (
-            0.5 if dataset_name == 'german' else 0.55
+            0.55
         )
     if not 0.0 <= threshold_min_sensitivity <= 1.0:
         raise ValueError("threshold_min_sensitivity must be in [0, 1].")
     if threshold_confidence is None:
         threshold_confidence = (
-            0.60 if dataset_name == 'german' else 0.80
+            0.80
         )
     if not 0.5 <= threshold_confidence < 1.0:
         raise ValueError("threshold_confidence must be in [0.5, 1).")
@@ -3858,40 +3588,25 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
     print(f"Running AA-BiLSTM Experiment on {dataset_name.upper()} Dataset")
     print(f"{'=' * 60}")
     print(f"Using device: {device}")
-    seed = (7 if dataset_name == 'german' else 42) if seed is None else seed
+    seed = 42 if seed is None else seed
     set_seed(seed)
 
     # 1. 数据加载
     data_loader = CreditDataLoader()
 
-    if dataset_name == 'german':
-        static_feat, temporal_feat, y = data_loader.load_german_credit(data_path)
-        batch_size = 32 if batch_size is None else batch_size
-        epoch = 30 if epoch is None else epoch
-        hidden_dim = 64 if hidden_dim is None else hidden_dim
-        num_layers = 2 if num_layers is None else num_layers
-        dropout = 0.25 if dropout is None else dropout
-        lr = 8e-4 if lr is None else lr
-        weight_decay = 2e-4 if weight_decay is None else weight_decay
-        focal_gamma_max = (
-            1.5 if focal_gamma_max is None else focal_gamma_max
-        )
-        ema_decay = 0.99 if ema_decay is None else ema_decay
-        patience = 12
-    else:
-        static_feat, temporal_feat, y = data_loader.load_taiwan_credit(data_path)
-        batch_size = 256 if batch_size is None else batch_size
-        epoch = 50 if epoch is None else epoch
-        hidden_dim = 96 if hidden_dim is None else hidden_dim
-        num_layers = 3 if num_layers is None else num_layers
-        dropout = 0.30 if dropout is None else dropout
-        lr = 7e-4 if lr is None else lr
-        weight_decay = 2e-4 if weight_decay is None else weight_decay
-        focal_gamma_max = (
-            1.75 if focal_gamma_max is None else focal_gamma_max
-        )
-        ema_decay = 0.995 if ema_decay is None else ema_decay
-        patience = 15
+    static_feat, temporal_feat, y = data_loader.load_taiwan_credit(data_path)
+    batch_size = 256 if batch_size is None else batch_size
+    epoch = 50 if epoch is None else epoch
+    hidden_dim = 96 if hidden_dim is None else hidden_dim
+    num_layers = 3 if num_layers is None else num_layers
+    dropout = 0.30 if dropout is None else dropout
+    lr = 7e-4 if lr is None else lr
+    weight_decay = 2e-4 if weight_decay is None else weight_decay
+    focal_gamma_max = (
+        1.75 if focal_gamma_max is None else focal_gamma_max
+    )
+    ema_decay = 0.995 if ema_decay is None else ema_decay
+    patience = 15
 
     if (
         batch_size < 1
@@ -3984,10 +3699,7 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
     static_dim = X_static_train.shape[1]
     temporal_steps = X_temporal_train.shape[1]
     temporal_dim = X_temporal_train.shape[2]
-    # German Credit 的”时序”由不同类别字段构造（伪时序），
-    # 各步之间没有真实的时间先后关系，局部突变注意力没有语义基础；
-    # 仅在 Taiwan 的真实月度序列上启用。
-    enable_local_attention = dataset_name == 'taiwan'
+    enable_local_attention = True
 
     # 模型工厂函数：支持 auto-tune 时用不同超参构建多个候选模型
     def build_model(candidate_hidden, candidate_layers, candidate_dropout):
@@ -4006,14 +3718,12 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
             local_window=min(3, temporal_steps),
             use_global_context=True,
             use_local_attention=enable_local_attention,
-            temporal_categorical_index=(
-                0 if dataset_name == 'taiwan' else None
-            ),
+            temporal_categorical_index=0,
             temporal_category_min=-2,
             temporal_category_max=8,
-            use_step_embedding=dataset_name == 'taiwan',
+            use_step_embedding=True,
             multiscale_mode=(
-                'lightweight' if dataset_name == 'taiwan' else 'legacy'
+                'lightweight'
             ),
         )
 
@@ -4177,10 +3887,10 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
         'threshold_confidence': float(threshold_confidence),
         'calibration_method': 'cross_fitted_platt',
         'multiscale_mode': (
-            'lightweight' if dataset_name == 'taiwan' else 'legacy'
+            'lightweight'
         ),
-        'temporal_state_embedding': dataset_name == 'taiwan',
-        'step_embedding': dataset_name == 'taiwan',
+        'temporal_state_embedding': True,
+        'step_embedding': True,
         'auto_tune': bool(auto_tune),
         'split_sizes': {
             name: int(len(indices))
@@ -4225,7 +3935,7 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
     analysis_split_name = 'test' if analysis_on_test else 'validation'
 
     # 6. 对比基准模型
-    if run_analysis:
+    if run_baselines:
         print(
             f"Comparison with baseline models on {analysis_split_name} split..."
         )
@@ -4236,7 +3946,7 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
                           batch_size=batch_size)
 
     # 7. 消融实验
-    if run_analysis:
+    if run_ablation:
         print("\nRunning ablation study...")
         run_ablation_study(static_dim, temporal_dim, temporal_steps,
                            train_loader, val_loader, analysis_loader,
@@ -4250,9 +3960,9 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
                            enable_local_attention=enable_local_attention,
                            enable_temporal_categorical=enable_local_attention,
                            multiscale_mode=(
-                               'lightweight' if dataset_name == 'taiwan' else 'legacy'
+                               'lightweight'
                            ),
-                           use_step_embedding=(dataset_name == 'taiwan'),
+                           use_step_embedding=True,
                            threshold_confidence=threshold_confidence,
                            threshold_min_sensitivity=threshold_min_sensitivity,
                            selection_metric=selection_metric,
@@ -4265,7 +3975,7 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
                            patience=patience)
 
 
-    if run_analysis:
+    if run_robustness:
         run_imbalance_robustness_study(
             X_static_train,
             X_temporal_train,
@@ -4289,9 +3999,9 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
             enable_local_attention=enable_local_attention,
             enable_temporal_categorical=enable_local_attention,
             multiscale_mode=(
-                'lightweight' if dataset_name == 'taiwan' else 'legacy'
+                'lightweight'
             ),
-            use_step_embedding=(dataset_name == 'taiwan'),
+            use_step_embedding=True,
             threshold_confidence=threshold_confidence,
             threshold_min_sensitivity=threshold_min_sensitivity,
             selection_metric=selection_metric,
@@ -4304,7 +4014,7 @@ def run_experiment(dataset_name='german', epoch=None, batch_size=None, data_path
             patience=patience
         )
 
-    if run_analysis:
+    if run_shap:
         run_shap_summary(
             model,
             data_loader,
@@ -4512,7 +4222,8 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
             'use_local': False,
             'use_ag': False,
             'use_bi': False,
-            'use_focal': False
+            'use_focal': False,
+            'use_standard_lstm': True,
         },
         {
             'name': '+ Multi-Scale Encoding',
@@ -4566,58 +4277,91 @@ def run_ablation_study(static_dim, temporal_dim, temporal_steps,
         if getattr(train_loader, 'generator', None) is not None:
             train_loader.generator.manual_seed(seed)
 
-        model = AABiLSTM(
-            static_dim=static_dim,
-            temporal_dim=temporal_dim,
-            temporal_steps=temporal_steps,
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
-            num_classes=2,
-            dropout=dropout,
-            use_fusion=config['use_cross'],
-            use_ag_resunit=config['use_ag'],
-            bidirectional=config['use_bi'],
-            use_multiscale=config['use_multiscale'],
-            local_window=min(3, temporal_steps),
-            use_global_context=config['use_global'],
-            use_local_attention=config['use_local'],
-            temporal_categorical_index=(
-                0 if enable_temporal_categorical else None
-            ),
-            use_step_embedding=use_step_embedding,
-            multiscale_mode=multiscale_mode,
-        )
-
-        trainer = Trainer(
-            model, train_loader, val_loader, test_loader,
-            calibration_loader=calibration_loader,
-            num_epochs=epoch,
-            lr=lr,
-            weight_decay=weight_decay,
-            use_dynamic_focal=config['use_focal'],
-            use_early_stopping=True,
-            threshold_min_sensitivity=threshold_min_sensitivity,
-            selection_metric=selection_metric,
-            threshold_objective=threshold_objective,
-            class_balance_power=class_balance_power,
-            focal_gamma_max=focal_gamma_max,
-            ema_decay=ema_decay,
-            calibrate_probabilities=calibrate_probabilities,
-            threshold_confidence=threshold_confidence,
-        )
-        trainer.early_stopping.patience = patience
-
-        metrics, _ = trainer.train()
-        row = {
-            'name': config['name'],
-            'auc': metrics['auc'],
-            'auc_pr': metrics['auc_pr'],
-            'accuracy': metrics['accuracy'],
-            'f1': metrics['f1'],
-            'sensitivity': metrics['sensitivity'],
-            'specificity': metrics['specificity'],
-            'parameters': sum(p.numel() for p in model.parameters())
-        }
+        if config.get('use_standard_lstm'):
+            # 标准 LSTM 基线：直接用 train_sequence_baseline（和基线对比完全一致）
+            model = SequenceBaselineModel(
+                static_dim=static_dim,
+                temporal_dim=temporal_dim,
+                hidden_dim=64,
+                model_type='lstm',
+                dropout=dropout,
+            )
+            train_ds = train_loader.dataset
+            test_ds = test_loader.dataset
+            metrics = train_sequence_baseline(
+                config['name'],
+                model,
+                train_ds.static_features.numpy(),
+                train_ds.temporal_features.numpy(),
+                train_ds.labels.numpy(),
+                test_ds.static_features.numpy(),
+                test_ds.temporal_features.numpy(),
+                test_ds.labels.numpy(),
+                epochs=30,
+                batch_size=train_loader.batch_size,
+                lr=1e-3,
+            )
+            row = {
+                'name': config['name'],
+                'auc': metrics['auc'],
+                'auc_pr': metrics['auc_pr'],
+                'accuracy': metrics['acc'],
+                'f1': metrics['f1'],
+                'sensitivity': metrics['sensitivity'],
+                'specificity': metrics['specificity'],
+                'parameters': sum(p.numel() for p in model.parameters()),
+            }
+        else:
+            model = AABiLSTM(
+                static_dim=static_dim,
+                temporal_dim=temporal_dim,
+                temporal_steps=temporal_steps,
+                hidden_dim=hidden_dim,
+                num_layers=num_layers,
+                num_classes=2,
+                dropout=dropout,
+                use_fusion=config['use_cross'],
+                use_ag_resunit=config['use_ag'],
+                bidirectional=config['use_bi'],
+                use_multiscale=config['use_multiscale'],
+                local_window=min(3, temporal_steps),
+                use_global_context=config['use_global'],
+                use_local_attention=config['use_local'],
+                temporal_categorical_index=(
+                    0 if enable_temporal_categorical else None
+                ),
+                use_step_embedding=use_step_embedding,
+                multiscale_mode=multiscale_mode,
+            )
+            trainer = Trainer(
+                model, train_loader, val_loader, test_loader,
+                calibration_loader=calibration_loader,
+                num_epochs=epoch,
+                lr=lr,
+                weight_decay=weight_decay,
+                use_dynamic_focal=config['use_focal'],
+                use_early_stopping=True,
+                threshold_min_sensitivity=threshold_min_sensitivity,
+                selection_metric=selection_metric,
+                threshold_objective=threshold_objective,
+                class_balance_power=class_balance_power,
+                focal_gamma_max=focal_gamma_max,
+                ema_decay=ema_decay,
+                calibrate_probabilities=calibrate_probabilities,
+                threshold_confidence=threshold_confidence,
+            )
+            trainer.early_stopping.patience = patience
+            metrics, _ = trainer.train()
+            row = {
+                'name': config['name'],
+                'auc': metrics['auc'],
+                'auc_pr': metrics['auc_pr'],
+                'accuracy': metrics['accuracy'],
+                'f1': metrics['f1'],
+                'sensitivity': metrics['sensitivity'],
+                'specificity': metrics['specificity'],
+                'parameters': sum(p.numel() for p in model.parameters()),
+            }
         results.append(row)
         print(
             f"Result: AUC={row['auc']:.4f}, AUC-PR={row['auc_pr']:.4f}, "
@@ -4790,7 +4534,7 @@ def run_imbalance_robustness_study(X_static_train, X_temporal_train, y_train,
         lstm_model = SequenceBaselineModel(
             static_dim=X_static_train.shape[1],
             temporal_dim=X_temporal_train.shape[2],
-            hidden_dim=min(hidden_dim, 128),
+            hidden_dim=64,
             model_type='lstm',
             dropout=dropout
         )
@@ -4803,9 +4547,9 @@ def run_imbalance_robustness_study(X_static_train, X_temporal_train, y_train,
             X_static_test,
             X_temporal_test,
             y_test,
-            epochs=epoch,
+            epochs=30,
             batch_size=batch_size,
-            lr=lr
+            lr=1e-3,
         )
 
         set_seed(int(rate * 10000) + seed)
@@ -5006,15 +4750,15 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description='Paper-aligned AA-BiLSTM credit-risk experiment.'
     )
-    parser.add_argument('--dataset', choices=['german', 'taiwan'], default=None)
+    parser.add_argument('--dataset', choices=['taiwan'], default=None)
     parser.add_argument('--data-path', default=None,
-                        help='Local German .data or Taiwan .xls/.xlsx/.csv file.')
+                        help='Local Taiwan .xls/.xlsx/.csv file.')
     parser.add_argument('--epochs', type=int, default=None,
-                        help='Default: optimized setting (30 German / 50 Taiwan).')
+                        help='Default: optimized setting (50 epochs).')
     parser.add_argument('--batch-size', type=int, default=None,
-                        help='Default: optimized setting (32 German / 256 Taiwan).')
+                        help='Default: optimized setting (256 batch size).')
     parser.add_argument('--seed', type=int, default=None,
-                        help='Default: 7 for German, 42 for Taiwan.')
+                        help='Default: 42.')
     parser.add_argument('--split-seed', type=int, default=42,
                         help=(
                             'Seed for stratified train/selection/calibration/'
@@ -5067,8 +4811,7 @@ def parse_args():
         type=float,
         default=None,
         help=(
-            'Validation sensitivity floor (default: 0.50 German / '
-            '0.55 Taiwan).'
+            'Validation sensitivity floor (default: 0.55).'
         ),
     )
     parser.add_argument(
@@ -5077,7 +4820,7 @@ def parse_args():
         default=None,
         help=(
             'One-sided Wilson confidence used for the sensitivity floor '
-            '(default: 0.60 German / 0.80 Taiwan).'
+            '(default: 0.80).'
         ),
     )
     parser.add_argument(
@@ -5104,13 +4847,13 @@ def parse_args():
         '--focal-gamma-max',
         type=float,
         default=None,
-        help='Override final focal gamma (default: 1.5 German / 1.75 Taiwan).',
+        help='Override final focal gamma (default: 1.75).',
     )
     parser.add_argument(
         '--ema-decay',
         type=float,
         default=None,
-        help='Override EMA decay (default: 0.99 German / 0.995 Taiwan).',
+        help='Override EMA decay (default: 0.995).',
     )
     parser.add_argument('--result-json', default=None,
                         help='Optional path for test metrics and audit summary.')
@@ -5121,18 +4864,57 @@ def parse_args():
         default=None,
         help='Optional path for a complete deployable experiment bundle.',
     )
-    analysis_group = parser.add_mutually_exclusive_group()
-    analysis_group.add_argument(
-        '--analysis',
-        dest='run_analysis',
+    parser.add_argument(
+        '--baselines',
+        dest='run_baselines',
         action='store_true',
-        help='Run baselines, strict ablation, robustness, SHAP and diagnostics.'
+        default=None,
+        help='Run baseline model comparison (Random Forest, XGBoost, LSTM variants).'
     )
-    analysis_group.add_argument(
-        '--no-analysis',
-        dest='run_analysis',
+    parser.add_argument(
+        '--no-baselines',
+        dest='run_baselines',
         action='store_false',
-        help='Skip the additional analysis suite.'
+        help='Skip baseline comparison.'
+    )
+    parser.add_argument(
+        '--ablation',
+        dest='run_ablation',
+        action='store_true',
+        default=None,
+        help='Run component ablation study.'
+    )
+    parser.add_argument(
+        '--no-ablation',
+        dest='run_ablation',
+        action='store_false',
+        help='Skip ablation study.'
+    )
+    parser.add_argument(
+        '--robustness',
+        dest='run_robustness',
+        action='store_true',
+        default=None,
+        help='Run imbalance robustness study.'
+    )
+    parser.add_argument(
+        '--no-robustness',
+        dest='run_robustness',
+        action='store_false',
+        help='Skip robustness study.'
+    )
+    parser.add_argument(
+        '--shap',
+        dest='run_shap',
+        action='store_true',
+        default=None,
+        help='Run SHAP explainability analysis.'
+    )
+    parser.add_argument(
+        '--no-shap',
+        dest='run_shap',
+        action='store_false',
+        help='Skip SHAP analysis.'
     )
     parser.add_argument(
         '--analysis-on-test',
@@ -5169,7 +4951,10 @@ def parse_args():
         help='Skip plot generation.'
     )
     parser.set_defaults(
-        run_analysis=None,
+        run_baselines=None,
+        run_ablation=None,
+        run_robustness=None,
+        run_shap=None,
         make_plots=None,
         calibrate_probabilities=True,
     )
@@ -5258,23 +5043,42 @@ if __name__ == '__main__':
     dataset_name = args.dataset
     if dataset_name is None:
         print("=" * 40)
-        print("Available datasets: german / taiwan")
-        while True:
-            choice = input("Enter dataset (german/taiwan): ").strip().lower()
-            if choice in {'german', 'taiwan'}:
-                dataset_name = choice
-                break
-            print("Invalid input. Enter 'german' or 'taiwan'.")
+        print("Using Taiwan Credit dataset")
+        dataset_name = "taiwan"
 
-    run_analysis = args.run_analysis
-    if run_analysis is None:
+    run_baselines = args.run_baselines
+    run_ablation = args.run_ablation
+    run_robustness = args.run_robustness
+    run_shap = args.run_shap
+    if any(x is None for x in [run_baselines, run_ablation, run_robustness, run_shap]):
         if args.dataset is not None:
-            run_analysis = False
+            run_baselines = False if run_baselines is None else run_baselines
+            run_ablation = False if run_ablation is None else run_ablation
+            run_robustness = False if run_robustness is None else run_robustness
+            run_shap = False if run_shap is None else run_shap
         else:
             while True:
-                ans = input("Run analysis (baselines + ablation)? (Y/N): ").strip().upper()
+                ans = input("Run baseline comparison? (Y/N): ").strip().upper()
                 if ans in {'Y', 'N'}:
-                    run_analysis = (ans == 'Y')
+                    run_baselines = (ans == 'Y')
+                    break
+                print("Invalid input. Enter Y or N.")
+            while True:
+                ans = input("Run ablation study? (Y/N): ").strip().upper()
+                if ans in {'Y', 'N'}:
+                    run_ablation = (ans == 'Y')
+                    break
+                print("Invalid input. Enter Y or N.")
+            while True:
+                ans = input("Run robustness study? (Y/N): ").strip().upper()
+                if ans in {'Y', 'N'}:
+                    run_robustness = (ans == 'Y')
+                    break
+                print("Invalid input. Enter Y or N.")
+            while True:
+                ans = input("Run SHAP analysis? (Y/N): ").strip().upper()
+                if ans in {'Y', 'N'}:
+                    run_shap = (ans == 'Y')
                     break
                 print("Invalid input. Enter Y or N.")
 
@@ -5299,7 +5103,10 @@ if __name__ == '__main__':
         epoch=args.epochs,
         batch_size=args.batch_size,
         data_path=args.data_path,
-        run_analysis=run_analysis,
+        run_baselines=run_baselines,
+        run_ablation=run_ablation,
+        run_robustness=run_robustness,
+        run_shap=run_shap,
         make_plots=make_plots,
         threshold_min_sensitivity=args.min_sensitivity,
         seed=args.seed,
@@ -5330,7 +5137,7 @@ if __name__ == '__main__':
         base_model_seed = (
             args.seed
             if args.seed is not None
-            else (7 if dataset_name == 'german' else 42)
+            else 42
         )
         for repeat_idx in range(1, args.repeat_runs):
             print(
@@ -5345,7 +5152,10 @@ if __name__ == '__main__':
                     args.split_seed + 1009 * repeat_idx
                     if args.vary_split_seed else args.split_seed
                 ),
-                'run_analysis': False,
+                'run_baselines': False,
+                'run_ablation': False,
+                'run_robustness': False,
+                'run_shap': False,
                 'make_plots': False,
                 'analysis_on_test': False,
                 'auto_tune': False,
